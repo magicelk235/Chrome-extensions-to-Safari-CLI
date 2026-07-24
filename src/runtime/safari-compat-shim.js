@@ -144,24 +144,6 @@ var __C2S_DEBUG__ = false;
   if (!api) return;
   // ────────────────────────────────────────────────────────────────────────────
 
-  // [DIAG] Universal tracer: record EVERY runtime message + port connect this context
-  // receives, into storage.local. Lets us confirm whether this (background) context is
-  // the one that actually receives the popover's traffic. Remove after debugging.
-  try {
-    if (typeof chrome !== "undefined" && chrome.runtime) {
-      if (chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
-        chrome.runtime.onMessage.addListener(function (m) {
-          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagMsgs", function (o) { var k = "__c2sDiagMsgs"; var a = (o && o[k]) || []; a.push({ t: Date.now(), keys: Object.keys(m || {}).slice(0, 6) }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
-        });
-      }
-      if (chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
-        chrome.runtime.onConnect.addListener(function (p) {
-          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagConn", function (o) { var k = "__c2sDiagConn"; var a = (o && o[k]) || []; a.push({ t: Date.now(), name: (p && p.name) || "" }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
-        });
-      }
-    }
-  } catch (e) {}
-
   // navigator.userAgent Chrome-version spoof. Websites (and extension code reacting
   // to the page) commonly sniff the Chrome version out of the UA
   // (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) to gate behaviour or build
@@ -5140,6 +5122,18 @@ var __C2S_DEBUG__ = false;
   // wired for messages Safari does deliver (e.g. content-script → bg).
   (function () {
     try {
+      // CONTENT SCRIPTS must keep their NATIVE chrome/browser. This block ends by
+      // republishing chrome/browser as a wrap() Proxy (for the storage relay + facade),
+      // and Safari's native content↔background runtime messaging only works on the real,
+      // unwrapped object — wrapping it silently drops delivery (TWP's content script sends
+      // translateHTML and the reply never arrives once chrome is a Proxy, so translation
+      // stalls). The relay is only needed on EXTENSION pages (popover/panel/options/bg),
+      // which run on the extension protocol; content scripts run on http(s). Bail here so a
+      // content script never gets the relay or the Proxy — it uses Safari's native transport,
+      // which delivers content→bg fine.
+      var __ctxProto = "";
+      try { __ctxProto = (typeof location !== "undefined" && location.protocol) || ""; } catch (e) {}
+      if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(__ctxProto)) return;
       var nativeChrome = (typeof chrome !== "undefined") ? chrome : null;
       var nativeBrowser = (typeof browser !== "undefined") ? browser : null;
       var probe = nativeChrome || nativeBrowser;

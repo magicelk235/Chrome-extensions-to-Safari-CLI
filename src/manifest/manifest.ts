@@ -1115,19 +1115,14 @@ export function transformManifest(
     }
   }
 
-  // Same for the MV2 background page: Safari builds it from background.scripts in
-  // array order, so the extension's own scripts run FIRST on raw Safari APIs. Reading
-  // any Chrome-only surface at load (e.g. chrome.runtime.onUpdateAvailable.addListener)
-  // then throws and aborts the whole background before its listeners register — the
-  // extension is dead (TWP: onUpdateAvailable crash → no translation). Prepend the shim
-  // + polyfill so they run before background.js, exactly as content scripts get them.
-  // (MV3 service workers are handled separately by convertServiceWorkerToBackgroundPage,
-  // which builds background.html with the shim as the first script tag.)
-  if ((opts.shimFile || opts.polyfillFile) && mv === 2 && Array.isArray(out.background?.scripts)) {
-    const scripts = out.background!.scripts as string[];
-    if (opts.shimFile && !scripts.includes(opts.shimFile)) scripts.unshift(opts.shimFile);
-    if (opts.polyfillFile && !scripts.includes(opts.polyfillFile)) scripts.unshift(opts.polyfillFile);
-  }
+  // Do NOT prepend the compat shim to an MV2 background.scripts list. The shim's storage
+  // relay republishes chrome/browser as a Proxy, and Safari only delivers a content
+  // script's native runtime.sendMessage to the background when the background's onMessage
+  // is registered on the REAL, unwrapped runtime — wrapping it drops that delivery, so a
+  // content script's request (e.g. TWP's translateHTML) never reaches the background and
+  // its reply never comes back. The pre-relay builds never injected the shim into the MV2
+  // background and worked; match that. (MV3 service workers are handled separately by
+  // convertServiceWorkerToBackgroundPage, which builds background.html with the shim.)
 
   return out;
 }
