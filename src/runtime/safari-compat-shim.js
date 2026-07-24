@@ -3071,8 +3071,6 @@ var __C2S_DEBUG__ = false;
     var __vManifest = {}; try { __vManifest = chrome.runtime.getManifest() || {}; } catch (e) {}
     var __vAct = __vManifest.action || __vManifest.browser_action || {};
     var __vPopupWired = !!(__vAct && __vAct.default_popup === "__viaduct-action.html");
-    var __vHotkeyWired = false;
-    try { var __vcs = __vManifest.content_scripts || []; for (var __ci = 0; __ci < __vcs.length; __ci++) { if ((__vcs[__ci].js || []).indexOf("__viaduct-hotkey.js") >= 0) { __vHotkeyWired = true; break; } } } catch (e) {}
     if (__vPopupWired) try {
       var __vClickStore = (self.__viaductOnClicked = self.__viaductOnClicked || []);
       var __vBridge = false;
@@ -3166,8 +3164,15 @@ var __C2S_DEBUG__ = false;
     // generated __viaduct-hotkey.js (present only when viaduct could determine the action
     // message) does that. The shim runs before the bundle's content script, so its
     // listeners are captured here.
+    //
+    // Do NOT gate this on the manifest's content_scripts: Safari strips content_scripts
+    // from getManifest() inside a content script, so any "is a hotkey wired" check derived
+    // from it reads false there and the capture never installed — the hotkey then replayed
+    // to an empty list and the toggle (SuperDev's Cmd+Shift+S sidebar) did nothing.
+    // Capturing always in a content-script context costs only a few listener refs; when no
+    // hotkey script exists the array is simply never read.
     try {
-      if (__vHotkeyWired && typeof window !== "undefined" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
+      if (typeof window !== "undefined" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
         var __vMsg = (self.__viaductMsgListeners = self.__viaductMsgListeners || []);
         var __vWrapOnMessage = function (rt) {
           if (!rt || !rt.onMessage || typeof rt.onMessage.addListener !== "function" || rt.onMessage.__viaductWrapped) return;
