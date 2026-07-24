@@ -839,14 +839,22 @@ function backgroundRegistersActionOnClicked(manifest: Manifest, extPath: string)
   const sw = manifest.background?.service_worker;
   if (typeof sw === "string") files.push(sw);
   for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  // Collective scan over all background files (not a per-file short-circuit): a non-empty
+  // setPopup ANYWHERE makes the button popup-driven, which wins over an onClicked
+  // registration in another file. Mirrors the shim's detector (runtime/shim.ts); the shim
+  // there is prepended to background.scripts and references onClicked without setPopup, so
+  // a per-file return-true would fire on it before reaching the bundle's own setPopup.
+  // Empty setPopup({popup:""}) clears the popup and doesn't count.
+  let sawOnClicked = false;
   for (const rel of files) {
     const p = join(extPath, rel.replace(/^\.?\//, ""));
     if (!existsSync(p)) continue;
     let src: string;
     try { src = readFileSync(p, "utf-8"); } catch { continue; }
-    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+    if (/setPopup\s*\(\s*\{[^}]*\bpopup\s*:\s*(["'`])(?!\1)[^"'`]/.test(src)) return false;
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) sawOnClicked = true;
   }
-  return false;
+  return sawOnClicked;
 }
 
 /** Produce the Safari-ready manifest. Pure: does not write to disk. */

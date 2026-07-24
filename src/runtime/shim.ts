@@ -458,22 +458,39 @@ function actionSlot(manifest: Manifest): "action" | "browser_action" | "page_act
   return (manifest.manifest_version ?? 2) === 3 ? "action" : "browser_action";
 }
 
+// True when a background source calls (browser|page)Action.setPopup with a non-empty
+// popup string — i.e. the toolbar button opens a popup wired at runtime. An empty popup
+// (`setPopup({popup:""})`) disables the popup and doesn't count. Loose regex to survive
+// minification: `setPopup(` … `popup:` "<non-empty>" within the same call.
+function setsNonEmptyPopup(src: string): boolean {
+  return /setPopup\s*\(\s*\{[^}]*\bpopup\s*:\s*(["'`])(?!\1)[^"'`]/.test(src);
+}
+
 /** Heuristic: do the manifest's background scripts register an action click handler? */
 function backgroundRegistersActionOnClicked(dir: string, manifest: Manifest): boolean {
   const files: string[] = [];
   const sw = manifest.background?.service_worker;
   if (typeof sw === "string") files.push(sw);
   for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  // Two passes over ALL background files, not a per-file short-circuit: viaduct prepends
+  // its own shim to background.scripts, and the shim references onClicked + action without
+  // any setPopup, so a per-file "onClicked here, no setPopup here → true" would fire on the
+  // shim before ever reaching the bundle's own background.js where the setPopup lives.
+  // A non-empty setPopup ANYWHERE means the button is popup-driven (Safari honors setPopup),
+  // so the bridge must not hijack it — that wins over an onClicked registration elsewhere.
+  // Empty setPopup({popup:""}) clears the popup and does not count. (TWP sets popup/popup.html.)
+  let sawOnClicked = false;
   for (const rel of files) {
     const p = join(dir, rel.replace(/^\.?\//, ""));
     if (!existsSync(p)) continue;
     let src: string;
     try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    if (setsNonEmptyPopup(src)) return false;
     // Loose but effective on minified bundles: an onClicked registration alongside an
     // action/browserAction reference. Favors wiring a working button over a miss.
-    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) sawOnClicked = true;
   }
-  return false;
+  return sawOnClicked;
 }
 
 /**
