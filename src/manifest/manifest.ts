@@ -403,13 +403,28 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
         if (typeof perm !== "string") continue;
         const looksLikeHost = perm === "<all_urls>" || perm.includes("://");
         if (looksLikeHost && !(perm in UNSUPPORTED_PERMISSIONS)) {
-          issues.push({
-            severity: "warning",
-            category: "permission",
-            message: `"${perm}" is a host match pattern in "${src}"; under MV3 it is ignored and grants no host access.`,
-            file: "manifest.json",
-            fix: `Move it into "${dest}" (MV3 requires URL patterns there, not in "${src}").`,
-          });
+          // A host pattern whose scheme Safari can't parse (chrome://favicon/, ws://…)
+          // isn't merely ignored — Safari rejects the whole manifest and the extension
+          // never loads. transformManifest drops these, so report it as auto-fixed
+          // rather than telling the author to move a value Safari can't grant anywhere.
+          if (perm !== "<all_urls>" && matchPatternError(perm) !== null) {
+            issues.push({
+              severity: "warning",
+              category: "permission",
+              message: `"${perm}" in "${src}" uses a scheme Safari can't parse; left in place Safari rejects the whole manifest and won't load the extension. It will be removed.`,
+              file: "manifest.json",
+              fix: `Chrome-only schemes have no Safari equivalent and can't be granted in "${dest}" either, so the entry is dropped.`,
+              autoFixed: true,
+            });
+          } else {
+            issues.push({
+              severity: "warning",
+              category: "permission",
+              message: `"${perm}" is a host match pattern in "${src}"; under MV3 it is ignored and grants no host access.`,
+              file: "manifest.json",
+              fix: `Move it into "${dest}" (MV3 requires URL patterns there, not in "${src}").`,
+            });
+          }
         }
       }
     }
@@ -865,9 +880,20 @@ export function transformManifest(
   }
 
   const removeSet = new Set(permissionsToRemove);
-  if (Array.isArray(out.permissions)) out.permissions = out.permissions.filter((p) => !removeSet.has(p));
+  // A permissions entry that is a host match pattern with a scheme Safari can't
+  // parse (chrome://favicon/, ws://…) is not just ignored like a stray https://
+  // pattern — Safari treats the whole manifest as invalid and refuses to load the
+  // extension. Drop those outright, the same way host_permissions filters them
+  // below. A plain name ("tabs") has no "://" so it's untouched, and a legal
+  // https:// pattern passes matchPatternError so the warn-don't-move behavior for
+  // misplaced host patterns is preserved.
+  const isUngrantablePattern = (p: unknown): boolean =>
+    typeof p === "string" && p.includes("://") && matchPatternError(p) !== null;
+  if (Array.isArray(out.permissions)) {
+    out.permissions = out.permissions.filter((p) => !removeSet.has(p) && !isUngrantablePattern(p));
+  }
   if (Array.isArray(out.optional_permissions)) {
-    out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p));
+    out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p) && !isUngrantablePattern(p));
   }
   // Safari rejects the declarativeNetRequestWithHostAccess token, but either token
   // grants the DNR API. Re-add plain declarativeNetRequest to whichever list the
