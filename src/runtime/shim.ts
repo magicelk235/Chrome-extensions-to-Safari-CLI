@@ -7,6 +7,13 @@ import { walkScripts } from "../input/stage.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
+// Fallback name used when the extension already ships its OWN browser-polyfill.min.js
+// (uBlock Origin does). Writing viaduct's polyfill over that file replaced the exact
+// build the extension's content scripts were compiled against; uBlock's vapi.js then
+// threw at load and every script after it in the content-script list (contentscript.js,
+// the cosmetic filter) never ran. Keep the extension's file intact and load viaduct's
+// under this distinct name instead.
+export const POLYFILL_ALT_FILENAME = "viaduct-browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
@@ -23,8 +30,13 @@ export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
 export function writePolyfill(targetDir: string): string | undefined {
   const src = join(TEMPLATE_DIR, POLYFILL_FILENAME);
   if (!existsSync(src)) return undefined;
-  copyFileSync(src, join(targetDir, POLYFILL_FILENAME));
-  return POLYFILL_FILENAME;
+  // Don't clobber the extension's own browser-polyfill.min.js. webextension-polyfill
+  // is idempotent (it no-ops once `browser` exists), so loading viaduct's copy under a
+  // second name alongside the extension's is harmless, whereas overwriting the
+  // extension's build breaks scripts compiled against it.
+  const name = existsSync(join(targetDir, POLYFILL_FILENAME)) ? POLYFILL_ALT_FILENAME : POLYFILL_FILENAME;
+  copyFileSync(src, join(targetDir, name));
+  return name;
 }
 
 /**
@@ -691,6 +703,7 @@ export function wirePageWorldMainInjection(dir: string, manifest: Manifest): str
   const ownFiles: Record<string, true> = {
     [SHIM_FILENAME]: true,
     [POLYFILL_FILENAME]: true,
+    [POLYFILL_ALT_FILENAME]: true,
     [SW_LIFECYCLE_FILENAME]: true,
     [ACTION_HOTKEY_FILENAME]: true,
   };
