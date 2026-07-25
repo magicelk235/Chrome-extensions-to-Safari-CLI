@@ -212,7 +212,14 @@ var __C2S_DEBUG__ = false;
 
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
-    return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
+    // __c2sInert marks a backfilled event that can never fire. Backfilling keeps a
+    // module-eval read from throwing, but anything that depends on delivery has to be
+    // able to tell this apart from the platform's own event (see the user-script
+    // injection wiring, which silently listened to one of these for three builds).
+    return {
+      addListener: function () {}, removeListener: function () {},
+      hasListener: function () { return false; }, __c2sInert: true,
+    };
   }
   // A live event with real listener storage + _emit, for emulated APIs that fire.
   function eventList() {
@@ -4633,8 +4640,9 @@ var __C2S_DEBUG__ = false;
         // document_start), so once it has actually delivered something, stop listening
         // to the coarser one. Until then tabs.onUpdated is the safety net.
         var sawCommitted = false;
+        var live = function (ev) { return !!(ev && typeof ev.addListener === "function" && !ev.__c2sInert); };
         try {
-          if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
+          if (chrome.webNavigation && live(chrome.webNavigation.onCommitted)) {
             chrome.webNavigation.onCommitted.addListener(function (d) {
               if (!d) return;
               sawCommitted = true;
@@ -4644,10 +4652,15 @@ var __C2S_DEBUG__ = false;
           }
         } catch (e) {}
         try {
-          if (chrome.tabs && chrome.tabs.onUpdated) {
+          if (chrome.tabs && live(chrome.tabs.onUpdated)) {
+            // No status filter: Safari does not have to report changeInfo.status, and
+            // gating on "loading" threw away the only navigation signal that fires. A
+            // URL is enough, and the dedupe below absorbs the repeats a chatty
+            // onUpdated produces.
             chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
-              if (sawCommitted || !info || info.status !== "loading") return;
-              injectFrame(tabId, null, info.url || (tab && tab.url));
+              if (sawCommitted) return;
+              var url = (info && info.url) || (tab && tab.url);
+              if (url) injectFrame(tabId, null, url);
             });
             signals.push("tabs.onUpdated");
           }

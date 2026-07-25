@@ -9,7 +9,7 @@ import { shimSource } from "../dist/runtime/shim.js";
 // every userscript through this API, so its scripts were stored, listed as enabled
 // in the popup, and never ran. Safari does have scripting.executeScript, so the
 // registry now drives the injection itself on each navigation.
-function boot() {
+function boot({ webNavigation = true } = {}) {
   const injected = [];
   const navListeners = [];
   const tabListeners = [];
@@ -32,9 +32,9 @@ function boot() {
           return Promise.resolve([{ result: undefined }]);
         },
       },
-      webNavigation: {
-        onCommitted: { addListener: (fn) => navListeners.push(fn) },
-      },
+      ...(webNavigation
+        ? { webNavigation: { onCommitted: { addListener: (fn) => navListeners.push(fn) } } }
+        : {}),
       tabs: {
         onUpdated: { addListener: (fn) => tabListeners.push(fn) },
       },
@@ -179,6 +179,31 @@ test("updating the code changes what gets injected", async () => {
   await sandbox.chrome.userScripts.update([{ id: "tm-1", js: [{ code: "window.__v = 2;" }] }]);
   navigate("https://example.com/x");
   assert.equal(injected[0].args[0], "window.__v = 2;");
+});
+
+test("a backfilled webNavigation is not mistaken for a working one", async () => {
+  // The shim backfills chrome.webNavigation.onCommitted with an inert event so a
+  // module-eval read can't throw. Wiring saw that stub, reported the signal as
+  // available, and listened to something that can never fire — live, that silently
+  // cost three build-and-reinstall rounds. Without webNavigation, injection must fall
+  // through to tabs.onUpdated and still work.
+  const { sandbox, injected, navListeners, tabListeners } = boot({ webNavigation: false });
+  assert.ok(sandbox.chrome.webNavigation.onCommitted.__c2sInert, "the backfill is a stub");
+  assert.equal(navListeners.length, 0, "nothing may listen to the stub");
+  assert.ok(tabListeners.length > 0, "the real signal must be wired instead");
+
+  await sandbox.chrome.userScripts.register([userScript()]);
+  for (const fn of tabListeners) fn(7, { url: "https://example.com/x" }, {});
+  assert.equal(injected.length, 1, "tabs.onUpdated must drive injection on its own");
+});
+
+test("tabs.onUpdated drives injection without a status field", async () => {
+  // Safari does not have to report changeInfo.status; gating on "loading" threw away
+  // the only signal that fires.
+  const { sandbox, injected, tabListeners } = boot({ webNavigation: false });
+  await sandbox.chrome.userScripts.register([userScript()]);
+  for (const fn of tabListeners) fn(7, {}, { url: "https://example.com/x" });
+  assert.equal(injected.length, 1, "the tab's own url is enough");
 });
 
 test("one navigation delivered by both signals injects once", async () => {
