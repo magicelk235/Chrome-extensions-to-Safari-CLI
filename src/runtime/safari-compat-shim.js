@@ -4808,9 +4808,64 @@ var __C2S_DEBUG__ = false;
     var wrapDnrUpdate = function (name) {
       var orig = dnrNs[name];
       if (typeof orig !== "function" || orig.__c2sWrapped) return;
+      // One call, resolving true when Safari accepted it. Passes both a callback and
+      // reads the returned promise so it works whichever style the platform hands us.
+      var tryOne = function (arg) {
+        return new Promise(function (res) {
+          var done = false;
+          var fin = function (ok) { if (!done) { done = true; res(ok); } };
+          try {
+            var p = orig.call(dnrNs, arg, function () {
+              var e = null;
+              try { e = chrome.runtime && chrome.runtime.lastError; } catch (e2) {}
+              fin(!e);
+            });
+            if (p && typeof p.then === "function") p.then(function () { fin(true); }, function () { fin(false); });
+          } catch (e) { fin(false); }
+        });
+      };
+      // Safari rejects the WHOLE update when any single rule is invalid, most often an
+      // unsupported regexFilter (WebKit's regex engine takes a narrower subset than
+      // Chrome's). All-or-nothing means one bad rule silently costs the extension every
+      // other rule in the batch: Tampermonkey registers all its *.user.js interception
+      // rules in one call, so a single unsupported pattern killed userscript-URL
+      // detection outright. Re-apply the removals, then add rules one at a time and
+      // keep whatever Safari accepts.
+      var salvage = function (opts) {
+        var kept = 0;
+        var chain = Promise.resolve();
+        if (opts && opts.removeRuleIds && opts.removeRuleIds.length) {
+          chain = chain.then(function () { return tryOne({ removeRuleIds: opts.removeRuleIds }); });
+        }
+        var add = (opts && opts.addRules) || [];
+        add.forEach(function (r) {
+          chain = chain.then(function () {
+            return tryOne({ addRules: [r] }).then(function (ok) { if (ok) kept++; });
+          });
+        });
+        return chain.then(function () { return kept; });
+      };
       var wrapped = function (opts, cb) {
         try { opts = stripModifyHeaders(opts); } catch (e) {}
-        return orig.call(dnrNs, opts, cb);
+        var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
+        if (typeof cb === "function") {
+          return orig.call(dnrNs, opts, function () {
+            var err = null;
+            try { err = chrome.runtime && chrome.runtime.lastError; } catch (e) {}
+            if (!err) { try { cb(); } catch (e) {} return; }
+            salvage(opts).then(function (kept) {
+              // Nothing landed at all: the original failure is the honest answer.
+              if (!kept && addCount) setLastErr({ message: String((err && err.message) || err) });
+              try { cb(); } finally { setLastErr(null); }
+            });
+          });
+        }
+        var p;
+        try { p = orig.call(dnrNs, opts); } catch (e) { p = Promise.reject(e); }
+        if (!p || typeof p.then !== "function") return p;
+        return p.catch(function (e) {
+          return salvage(opts).then(function (kept) { if (!kept && addCount) throw e; });
+        });
       };
       // Bare assignment can silently no-op (or throw) on Safari's exotic DNR slot;
       // only mark it wrapped once the install is verified to have taken.
