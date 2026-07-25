@@ -2515,7 +2515,28 @@ var __C2S_DEBUG__ = false;
               id: "c2s-offscreen", type: "window", url: __offscreenAbsUrl,
               frameType: "nested", focused: false, visibilityState: "hidden",
               focus: function () { return Promise.resolve(this); },
-              postMessage: function () {},
+              // A real client.postMessage arrives as a "message" event on the client
+              // document's navigator.serviceWorker, carrying any transferred ports.
+              // Dropping it strands every caller that awaits a reply on a transferred
+              // MessagePort — Chrome's documented SW->offscreen binary handshake
+              // (client.postMessage(msg, [port2]) then await port1.onmessage). Nothing
+              // throws, so it reads as a silent hang: live, Tampermonkey's editor save
+              // wraps the script source in an object URL created offscreen, and saving
+              // any userscript spun forever on "Please wait...".
+              postMessage: function (data, transfer) {
+                var w = __offscreenFrame && __offscreenFrame.contentWindow;
+                if (!w) return;
+                var ports = transfer || [];
+                try {
+                  var sw = w.navigator && w.navigator.serviceWorker;
+                  if (sw && typeof sw.dispatchEvent === "function" && w.MessageEvent) {
+                    sw.dispatchEvent(new w.MessageEvent("message", { data: data, ports: ports }));
+                    return;
+                  }
+                } catch (e) {}
+                // Fall back to a window message for offscreen docs that listen there.
+                try { w.postMessage(data, "*", ports); } catch (e) {}
+              },
             });
             return Promise.resolve(out);
           },
