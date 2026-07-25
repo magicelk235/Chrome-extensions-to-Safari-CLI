@@ -4455,12 +4455,13 @@ var __C2S_DEBUG__ = false;
       updateVoices: function () {},
       onSpeak: event(), onStop: event(), onPause: event(), onResume: event(),
     });
-    // chrome.userScripts — Safari has no persistent user-script registry, so keep a
-    // coherent in-memory one: register/getScripts/update/unregister round-trip
-    // correctly (the common "register then query/manage" pattern). This
-    // does NOT actually inject the scripts (WebKit gives no API for dynamic user
-    // worlds); it makes the management surface consistent so callers don't reject.
-    // Upgrade path: map to scripting.registerContentScripts if/when Safari exposes it.
+    // chrome.userScripts — Safari has no dynamic user-script registry, so the shim
+    // keeps the in-memory one AND runs it: register/getScripts/update/unregister
+    // round-trip, and each registered script is injected on navigation through
+    // scripting.executeScript, which Safari does support. Bookkeeping alone is not
+    // enough for the extensions that matter here — Tampermonkey ships NO
+    // content_scripts and registers every userscript through this API, so a registry
+    // that never injects means scripts save, list as enabled, and never run.
     chrome.userScripts = chrome.userScripts || {};
     (function () {
       var scripts = {}; // id -> RegisteredUserScript
@@ -4472,6 +4473,7 @@ var __C2S_DEBUG__ = false;
             if (scripts[s.id]) return rejectOrCb(new Error("Duplicate script id: " + s.id), cb);
           }
           for (var j = 0; j < arr.length; j++) scripts[arr[j].id] = shallowCopy(arr[j]);
+          wireInjection();
           return dual(undefined, cb);
         },
         unregister: function (filter, cb) {
@@ -4499,6 +4501,126 @@ var __C2S_DEBUG__ = false;
       });
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
       function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); }
+
+      // ── running the registry ────────────────────────────────────────────────
+      // Chrome match patterns and globs, compiled once per string.
+      var reCache = {};
+      function escapeRe(str) { return String(str).replace(/[.+^${}()|[\]\\?]/g, "\\$&"); }
+      function patternToRe(pattern) {
+        if (reCache[pattern] !== undefined) return reCache[pattern];
+        var re = null;
+        if (pattern === "<all_urls>") {
+          re = /^(?:https?|file|ftp):\/\//;
+        } else {
+          var m = /^(\*|[a-z][a-z0-9+.-]*):\/\/(\*|(?:\*\.)?[^/*]*)(\/.*)$/i.exec(pattern);
+          if (m) {
+            var scheme = m[1] === "*" ? "https?" : escapeRe(m[1]);
+            var host = m[2];
+            var hostRe = host === "*" ? "[^/]+"
+              : host.indexOf("*.") === 0 ? "(?:[^/]+\\.)?" + escapeRe(host.slice(2))
+              : escapeRe(host);
+            var pathRe = escapeRe(m[3]).replace(/\*/g, ".*");
+            try { re = new RegExp("^" + scheme + ":\\/\\/" + hostRe + pathRe + "$"); } catch (e) { re = null; }
+          }
+        }
+        reCache[pattern] = re;
+        return re;
+      }
+      function globToRe(glob) {
+        var key = "\u0000glob" + glob;
+        if (reCache[key] !== undefined) return reCache[key];
+        var re = null;
+        try { re = new RegExp("^" + escapeRe(glob).replace(/\*/g, ".*").replace(/\\\?/g, ".") + "$"); } catch (e) {}
+        reCache[key] = re;
+        return re;
+      }
+      function anyMatch(list, url, toRe) {
+        if (!list || !list.length) return false;
+        for (var i = 0; i < list.length; i++) { var re = toRe(list[i]); if (re && re.test(url)) return true; }
+        return false;
+      }
+      function appliesTo(rec, url) {
+        if (!anyMatch(rec.matches, url, patternToRe)) return false;
+        if (anyMatch(rec.excludeMatches, url, patternToRe)) return false;
+        if (rec.includeGlobs && rec.includeGlobs.length && !anyMatch(rec.includeGlobs, url, globToRe)) return false;
+        if (anyMatch(rec.excludeGlobs, url, globToRe)) return false;
+        return true;
+      }
+      // Serialized into the page by executeScript, so it can only use its arguments.
+      function userScriptRunner(code, id) {
+        try { (0, eval)(code); }
+        catch (e) { try { console.error("[viaduct] user script " + id + " failed:", e); } catch (e2) {} }
+      }
+      function injectFrame(tabId, frameId, url) {
+        if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null || !url) return;
+        for (var id in scripts) {
+          var rec = scripts[id];
+          if (!rec) continue;
+          // A subframe navigation only runs the scripts that asked for all frames.
+          if (frameId != null && frameId !== 0 && !rec.allFrames) continue;
+          if (!appliesTo(rec, url)) continue;
+          var files = [], code = "";
+          var js = Array.isArray(rec.js) ? rec.js : [];
+          for (var i = 0; i < js.length; i++) {
+            if (!js[i]) continue;
+            if (js[i].file) files.push(js[i].file);
+            else if (js[i].code) code += (code ? "\n;" : "") + js[i].code;
+          }
+          var target = { tabId: tabId };
+          if (frameId != null) target.frameIds = [frameId]; else target.allFrames = !!rec.allFrames;
+          // Chrome's USER_SCRIPT world has no Safari equivalent. The isolated world is
+          // the closest thing and it's the one where chrome.runtime lives, which is what
+          // a manager's GM bridge needs to reach its background. MAIN is passed through
+          // for scripts that genuinely want page globals; Safari runs those under the
+          // PAGE's CSP, so a strict-CSP page can refuse the eval (see the CDP shim's
+          // pageExec for the same tradeoff).
+          var base = { target: target, injectImmediately: rec.runAt === "document_start" };
+          if (rec.world === "MAIN") base.world = "MAIN";
+          if (files.length) run(assign({}, base, { files: files }));
+          if (code) run(assign({}, base, { func: userScriptRunner, args: [code, id] }));
+        }
+        function run(opts) {
+          try {
+            var p = chrome.scripting.executeScript(opts);
+            if (p && typeof p.catch === "function") {
+              p.catch(function () {
+                // A MAIN-world refusal (missing support, or the page's CSP) still leaves
+                // the isolated world, where the script at least sees the DOM.
+                if (opts.world !== "MAIN") return;
+                var iso = assign({}, opts); delete iso.world;
+                try { var q = chrome.scripting.executeScript(iso); if (q && q.catch) q.catch(function () {}); } catch (e) {}
+              });
+            }
+          } catch (e) {}
+        }
+        function assign(t) {
+          for (var a = 1; a < arguments.length; a++) { var src = arguments[a]; for (var k in src) t[k] = src[k]; }
+          return t;
+        }
+      }
+      // Wired on the first register() — only a background context registers scripts,
+      // so this needs no context sniffing.
+      var wired = false;
+      function wireInjection() {
+        if (wired) return;
+        wired = true;
+        try {
+          if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
+            chrome.webNavigation.onCommitted.addListener(function (d) {
+              if (d) injectFrame(d.tabId, d.frameId, d.url);
+            });
+            return;
+          }
+        } catch (e) {}
+        // No webNavigation permission: tabs.onUpdated is later and frame-blind, but it
+        // is the only other navigation signal available.
+        try {
+          chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
+            if (!info || info.status !== "loading") return;
+            injectFrame(tabId, null, info.url || (tab && tab.url));
+          });
+        } catch (e) {}
+      }
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /
