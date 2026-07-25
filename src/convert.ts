@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, idempotentContentScriptGlobals } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -171,6 +171,13 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // sees "" (Salesforce Inspector Reloaded: blank action popup).
     const guardedAncestors = guardAncestorOriginsAccess(stageDir);
     if (guardedAncestors > 0) ok(`Guarded location.ancestorOrigins[0] reads in ${guardedAncestors} script(s)`);
+
+    // Safari drops the last entry of each _locales/<locale>/messages.json, so whatever
+    // string happens to be last in the file resolves to "" and the extension renders
+    // its raw message key (Tampermonkey's dashboard showed a literal "v0version0" for
+    // its version). Append a sacrificial message to take the hit.
+    const guardedLocales = guardLocaleTailMessage(stageDir);
+    if (guardedLocales > 0) ok(`Guarded the last message in ${guardedLocales} locale catalog(s) (Safari drops it)`);
 
     // Derived once and shared by the shim allowlist (below) and the Swift native
     // allowlist (later). transformManifest deep-clones its input, so the value is

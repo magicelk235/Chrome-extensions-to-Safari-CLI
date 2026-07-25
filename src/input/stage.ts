@@ -126,6 +126,58 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
 
+// Safari drops the LAST entry of _locales/<locale>/messages.json. Live on
+// Tampermonkey: `v0version0` ("v$version$") is the final message and getMessage
+// returned "" for it in every form — no substitution, string substitution, array
+// substitution — while `top_level_await`, the entry immediately before it, resolved
+// fine. Nothing about the entry is special (its neighbours past the same byte offset
+// work, and other placeholder messages work); it is dropped for being last. The
+// extension then falls back to displaying the raw message key, which is how the
+// Tampermonkey dashboard came to render a literal "v0version0" as its version.
+//
+// Append a sacrificial message so the extension's own last string is no longer last.
+// The insert is textual, before the closing brace, so every existing byte (formatting,
+// escapes, unicode) survives exactly as shipped. Returns files modified.
+const LOCALE_TAIL_GUARD = "viaduct_locale_tail_guard";
+
+export function guardLocaleTailMessage(stageDir: string): number {
+  const localesDir = join(stageDir, "_locales");
+  if (!existsSync(localesDir)) return 0;
+  let modified = 0;
+  for (const entry of readdirSync(localesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const file = join(localesDir, entry.name, "messages.json");
+    if (!existsSync(file)) continue;
+    let raw: string;
+    try {
+      raw = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    // Only touch a catalog we can confirm is a non-empty JSON object — a broken or
+    // empty one has no last message to lose, and rewriting it could only make things
+    // worse.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const keys = Object.keys(parsed as Record<string, unknown>);
+    if (keys.length === 0 || keys[keys.length - 1] === LOCALE_TAIL_GUARD) continue;
+    const close = raw.lastIndexOf("}");
+    if (close < 0) continue;
+    const next =
+      raw.slice(0, close) +
+      `,"${LOCALE_TAIL_GUARD}":{"message":"viaduct"}` +
+      raw.slice(close);
+    writeFileSync(file, next, "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
 export function walkScripts(dir: string, acc: string[] = []): string[] {
   let entries;
   try {
