@@ -4619,9 +4619,16 @@ var __C2S_DEBUG__ = false;
           chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
             var req = msg && msg.__viaductUserScripts;
             if (!req || !req.url) return;
+            // onMessage reaches EVERY extension page, and each one runs this shim with
+            // its own registry. Only the context that actually holds scripts may answer:
+            // a popup or options page would otherwise win the race with an empty list and
+            // the page would be told there is nothing to run.
+            var total = 0;
+            for (var k in scripts) total++;
+            if (!total) return;
             var list = collectFor(req.url, req.top !== false);
+            usLog("request from " + req.url + ": " + list.length + "/" + total + " registered script(s) match");
             resolveFiles(list).then(function (l) {
-              if (l.length) usLog("serving " + l.length + " script(s) to " + req.url);
               try { sendResponse({ scripts: l }); } catch (e) {}
             });
             return true;

@@ -764,15 +764,27 @@ export function wireUserScriptsContentScript(
       });
     }
   }
+  // Logged from the page's own console, which is the only place an isolated-world
+  // content script is observable from outside. Reading a flag off window does not work:
+  // the page console evaluates in the page world and never sees this one.
+  function log(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
   try {
+    log("injector running on " + location.href);
     chrome.runtime.sendMessage(
       { __viaductUserScripts: { url: location.href, top: window.top === window } },
       function (resp) {
-        try { if (chrome.runtime.lastError) return; } catch (e) {}
-        run(resp && resp.scripts);
+        try {
+          if (chrome.runtime.lastError) {
+            log("background did not answer: " + chrome.runtime.lastError.message);
+            return;
+          }
+        } catch (e) {}
+        var list = (resp && resp.scripts) || [];
+        log("received " + list.length + " script(s)");
+        run(list);
       }
     );
-  } catch (e) {}
+  } catch (e) { log("could not reach the background: " + ((e && e.message) || e)); }
 })();
 `;
   writeFileSync(join(dir, USERSCRIPTS_CS_FILENAME), js, "utf-8");

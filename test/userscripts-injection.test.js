@@ -110,7 +110,9 @@ test("unregistering stops it being served", async () => {
   const { sandbox, ask } = boot();
   await sandbox.chrome.userScripts.register([userScript()]);
   await sandbox.chrome.userScripts.unregister({ ids: ["tm-1"] });
-  assert.deepEqual(ids(await ask("https://example.com/x")), []);
+  // Nothing left to hold, so this context abstains entirely rather than answering
+  // empty and shouting down a context that does hold scripts.
+  assert.equal(await ask("https://example.com/x"), undefined);
 });
 
 test("updating the code changes what is served", async () => {
@@ -126,6 +128,20 @@ test("<all_urls> matches http and https", async () => {
   await sandbox.chrome.userScripts.register([userScript({ matches: ["<all_urls>"] })]);
   assert.deepEqual(ids(await ask("http://anything.test/a")), ["tm-1"]);
   assert.deepEqual(ids(await ask("https://other.test/b")), ["tm-1"]);
+});
+
+test("an extension page with no scripts abstains instead of answering empty", async () => {
+  // onMessage reaches every extension page, each running this shim with its own
+  // registry. A popup or options page answering first with an empty list tells the
+  // content script there is nothing to run, even though the background holds the
+  // scripts — live, that is exactly what produced "received 0 script(s)".
+  const { listeners } = boot(); // nothing registered in this context
+  let answered = false;
+  const kept = listeners.some(
+    (fn) => fn({ __viaductUserScripts: { url: "https://example.com/x", top: true } }, {}, () => { answered = true; }) === true,
+  );
+  assert.equal(kept, false, "an empty context must not keep the channel open");
+  assert.equal(answered, false, "and must not answer");
 });
 
 test("a message that isn't ours is left alone for the extension's own handlers", async () => {
