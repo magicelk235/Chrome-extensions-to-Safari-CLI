@@ -768,27 +768,36 @@ export function wireUserScriptsContentScript(
   // content script is observable from outside. Reading a flag off window does not work:
   // the page console evaluates in the page world and never sees this one.
   function log(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
-  try {
-    log("injector running on " + location.href);
-    chrome.runtime.sendMessage(
-      { __viaductUserScripts: { url: location.href, top: window.top === window } },
-      function (resp) {
-        try {
-          if (chrome.runtime.lastError) {
-            log("background did not answer: " + chrome.runtime.lastError.message);
-            return;
-          }
-        } catch (e) {}
-        if (!resp || !resp.scripts) {
-          // Another onMessage listener answered this first; its reply is not ours.
-          log("no answer from the registry (another listener replied: " + JSON.stringify(resp) + ")");
-          return;
+  // The background is non-persistent and this runs at document_start, so the registry
+  // is often not populated yet: the extension re-registers its scripts while its
+  // background is still booting. A context holding no scripts stays silent rather than
+  // answering empty, so silence means "ask again shortly", not "nothing to run".
+  var attempts = 0;
+  var MAX_ATTEMPTS = 12;
+  var RETRY_MS = 250;
+  function requestScripts() {
+    attempts++;
+    var retry = function (why) {
+      if (attempts < MAX_ATTEMPTS) { setTimeout(requestScripts, RETRY_MS); return; }
+      log("gave up after " + attempts + " attempts: " + why);
+    };
+    try {
+      chrome.runtime.sendMessage(
+        { __viaductUserScripts: { url: location.href, top: window.top === window } },
+        function (resp) {
+          try {
+            if (chrome.runtime.lastError) return retry("no listener (" + chrome.runtime.lastError.message + ")");
+          } catch (e) {}
+          // A reply without our shape came from someone else's onMessage handler.
+          if (!resp || !resp.scripts) return retry("answered by another listener: " + JSON.stringify(resp));
+          log("received " + resp.scripts.length + " script(s) after " + attempts + " attempt(s)");
+          run(resp.scripts);
         }
-        log("received " + resp.scripts.length + " script(s)");
-        run(resp.scripts);
-      }
-    );
-  } catch (e) { log("could not reach the background: " + ((e && e.message) || e)); }
+      );
+    } catch (e) { retry("send failed: " + ((e && e.message) || e)); }
+  }
+  log("injector running on " + location.href);
+  requestScripts();
 })();
 `;
   writeFileSync(join(dir, USERSCRIPTS_CS_FILENAME), js, "utf-8");
