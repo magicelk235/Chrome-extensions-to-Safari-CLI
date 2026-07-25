@@ -17,6 +17,7 @@ export const POLYFILL_ALT_FILENAME = "viaduct-browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
+export const USERSCRIPTS_CS_FILENAME = "__viaduct-userscripts.js";
 export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
 
 /**
@@ -714,6 +715,83 @@ const PAGE_WORLD_INJECT_RE =
  * harmlessly while the MAIN-world content script does the real work. Returns the wired
  * resource paths.
  */
+/**
+ * Give chrome.userScripts a way to actually reach the page.
+ *
+ * Safari delivers no navigation events to a converted background page (neither
+ * tabs.onUpdated nor webNavigation.onCommitted, verified live), so the shim's
+ * userScripts registry has no way to inject on its own. A DECLARED content script does
+ * run, so wire one that reports its URL to the background and evaluates whatever the
+ * registry says matches. It runs in the isolated world, where chrome.runtime is
+ * available for a manager's own bridge.
+ *
+ * Only wired when the extension declares the userScripts permission, so nothing else
+ * gains a content script it never asked for. Call BEFORE transformManifest, which
+ * strips that permission for Safari. Returns the filename, or null when not applicable.
+ */
+export function wireUserScriptsContentScript(
+  dir: string,
+  manifest: Manifest,
+  original: Manifest = manifest,
+): string | null {
+  const perms = [
+    ...(Array.isArray(original.permissions) ? original.permissions : []),
+    ...(Array.isArray(original.optional_permissions) ? original.optional_permissions : []),
+  ];
+  if (!perms.includes("userScripts")) return null;
+
+  const js = `// Injected by viaduct: runs the scripts registered through chrome.userScripts.
+// Safari fires no navigation event the background could inject from, so the page asks.
+(function () {
+  if (window.__viaductUserScriptsRan) return;
+  window.__viaductUserScriptsRan = true;
+  function exec(s) {
+    try { (0, eval)(s.code); }
+    catch (e) { try { console.error("[viaduct] user script " + s.id + " failed:", e); } catch (e2) {} }
+  }
+  function run(list) {
+    if (!list || !list.length) return;
+    var later = [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (!s || !s.code) continue;
+      if (s.runAt === "document_start" || document.readyState !== "loading") exec(s);
+      else later.push(s);
+    }
+    if (later.length) {
+      document.addEventListener("DOMContentLoaded", function () {
+        for (var j = 0; j < later.length; j++) exec(later[j]);
+      });
+    }
+  }
+  try {
+    chrome.runtime.sendMessage(
+      { __viaductUserScripts: { url: location.href, top: window.top === window } },
+      function (resp) {
+        try { if (chrome.runtime.lastError) return; } catch (e) {}
+        run(resp && resp.scripts);
+      }
+    );
+  } catch (e) {}
+})();
+`;
+  writeFileSync(join(dir, USERSCRIPTS_CS_FILENAME), js, "utf-8");
+
+  if (!Array.isArray(manifest.content_scripts)) manifest.content_scripts = [];
+  const already = manifest.content_scripts.some(
+    (cs) => Array.isArray(cs.js) && cs.js.includes(USERSCRIPTS_CS_FILENAME),
+  );
+  if (!already) {
+    manifest.content_scripts.push({
+      matches: ["<all_urls>"],
+      js: [USERSCRIPTS_CS_FILENAME],
+      run_at: "document_start",
+      all_frames: true,
+    });
+  }
+  return USERSCRIPTS_CS_FILENAME;
+}
+
 export function wirePageWorldMainInjection(dir: string, manifest: Manifest): string[] {
   if (!Array.isArray(manifest.content_scripts)) manifest.content_scripts = [];
   // Never scan or re-wire viaduct's own injected files.
@@ -723,6 +801,7 @@ export function wirePageWorldMainInjection(dir: string, manifest: Manifest): str
     [POLYFILL_ALT_FILENAME]: true,
     [SW_LIFECYCLE_FILENAME]: true,
     [ACTION_HOTKEY_FILENAME]: true,
+    [USERSCRIPTS_CS_FILENAME]: true,
   };
   const targets = new Set<string>();
   for (const file of walkScripts(dir)) {

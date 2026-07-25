@@ -7,7 +7,7 @@ import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
-import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
+import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
@@ -247,6 +247,13 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const mainWorld = wirePageWorldMainInjection(stageDir, transformed);
     if (mainWorld.length > 0) {
       ok(`Page-world injection → world:"MAIN" content script (Safari 18.4+, CSP-exempt): ${mainWorld.join(", ")}`);
+    }
+
+    // chrome.userScripts has no way to reach the page on its own: Safari delivers no
+    // navigation event to a converted background page, so the registry can't inject from
+    // one. A declared content script does run, so give the registry one to serve.
+    if (wireUserScriptsContentScript(stageDir, transformed, manifest)) {
+      ok("chrome.userScripts → content-script injector wired (Safari fires no navigation events)");
     }
 
     const synthIcons = synthesizePlaceholderIcons(stageDir, transformed, appName);

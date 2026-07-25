@@ -4509,7 +4509,19 @@ var __C2S_DEBUG__ = false;
       function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); }
 
       // ── running the registry ────────────────────────────────────────────────
-      // Chrome match patterns and globs, compiled once per string.
+      // Safari delivers NO navigation events to a converted background page: neither
+      // tabs.onUpdated nor webNavigation.onCommitted ever fired, with listeners
+      // registered at background load and again live from the inspector, on a page that
+      // was demonstrably awake. Both events read as present and non-inert, so there is
+      // no capability check that would have caught it. Registered user scripts therefore
+      // cannot be injected from a navigation listener at all.
+      //
+      // A DECLARED content script does run — that is how every working converted
+      // extension reaches the page — so viaduct injects one (see
+      // wireUserScriptsContentScript) that reports its URL and evaluates whatever the
+      // registry says matches. It runs in the isolated world, where chrome.runtime is
+      // available, which is what a manager's own GM-style bridge needs to reach its
+      // background.
       var reCache = {};
       function escapeRe(str) { return String(str).replace(/[.+^${}()|[\]\\?]/g, "\\$&"); }
       function patternToRe(pattern) {
@@ -4552,124 +4564,70 @@ var __C2S_DEBUG__ = false;
         if (anyMatch(rec.excludeGlobs, url, globToRe)) return false;
         return true;
       }
-      // Serialized into the page by executeScript, so it can only use its arguments.
-      function userScriptRunner(code, id) {
-        try { (0, eval)(code); }
-        catch (e) { try { console.error("[viaduct] user script " + id + " failed:", e); } catch (e2) {} }
-      }
-      // The two navigation signals both fire for one navigation, so remember what was
-      // injected recently and skip the repeat. Keyed by time, not URL: a reload is the
-      // same URL and must inject again.
-      var recent = {};
-      var DEDUPE_MS = 1000;
-      function injectFrame(tabId, frameId, url) {
-        if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null || !url) return;
-        var ids = Object.keys(scripts);
-        if (!ids.length) return;
-        var considered = 0;
-        for (var n = 0; n < ids.length; n++) {
-          var id = ids[n];
+      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
+
+      function collectFor(url, isTop) {
+        var out = [];
+        for (var id in scripts) {
           var rec = scripts[id];
           if (!rec) continue;
-          // A subframe navigation only runs the scripts that asked for all frames.
-          if (frameId != null && frameId !== 0 && !rec.allFrames) continue;
+          if (!isTop && !rec.allFrames) continue;
           if (!appliesTo(rec, url)) continue;
-          var key = tabId + "|" + (frameId || 0) + "|" + id + "|" + url;
-          var now = Date.now();
-          if (recent[key] && now - recent[key] < DEDUPE_MS) continue;
-          recent[key] = now;
-          considered++;
-          var files = [], code = "";
           var js = Array.isArray(rec.js) ? rec.js : [];
+          var code = "", files = [];
           for (var i = 0; i < js.length; i++) {
             if (!js[i]) continue;
-            if (js[i].file) files.push(js[i].file);
-            else if (js[i].code) code += (code ? "\n;" : "") + js[i].code;
+            if (js[i].code) code += (code ? "\n;" : "") + js[i].code;
+            else if (js[i].file) files.push(js[i].file);
           }
-          var target = { tabId: tabId };
-          if (frameId != null) target.frameIds = [frameId]; else target.allFrames = !!rec.allFrames;
-          // Chrome's USER_SCRIPT world has no Safari equivalent. The isolated world is
-          // the closest thing and it's the one where chrome.runtime lives, which is what
-          // a manager's GM bridge needs to reach its background. MAIN is passed through
-          // for scripts that genuinely want page globals; Safari runs those under the
-          // PAGE's CSP, so a strict-CSP page can refuse the eval (see the CDP shim's
-          // pageExec for the same tradeoff).
-          var base = { target: target, injectImmediately: rec.runAt === "document_start" };
-          if (rec.world === "MAIN") base.world = "MAIN";
-          if (files.length) run(assign({}, base, { files: files }));
-          if (code) run(assign({}, base, { func: userScriptRunner, args: [code, id] }));
+          out.push({ id: id, code: code, files: files, runAt: rec.runAt });
         }
-        if (!considered) usLog("no script matched " + url + " (" + ids.length + " registered)");
-        else usLog("injecting " + considered + " script(s) into " + url);
-        function run(opts) {
-          var fail = function (e) { try { console.error("[viaduct] user-script injection failed:", e); } catch (e2) {} };
-          try {
-            var p = chrome.scripting.executeScript(opts);
-            if (p && typeof p.catch === "function") {
-              p.catch(function (e) {
-                // A MAIN-world refusal (missing support, or the page's CSP) still leaves
-                // the isolated world, where the script at least sees the DOM.
-                if (opts.world !== "MAIN") return fail(e);
-                var iso = assign({}, opts); delete iso.world;
-                try { var q = chrome.scripting.executeScript(iso); if (q && q.catch) q.catch(fail); } catch (e2) { fail(e2); }
-              });
+        return out;
+      }
+      // File-backed entries are read here rather than in the page: the content script
+      // would have to fetch them as web-accessible resources, and they need not be.
+      function resolveFiles(list) {
+        var pending = [];
+        for (var i = 0; i < list.length; i++) {
+          (function (entry) {
+            for (var f = 0; f < entry.files.length; f++) {
+              (function (file) {
+                try {
+                  pending.push(fetch(chrome.runtime.getURL(file))
+                    .then(function (r) { return r.text(); })
+                    .then(function (t) { entry.code += (entry.code ? "\n;" : "") + t; })
+                    .catch(function () {}));
+                } catch (e) {}
+              })(entry.files[f]);
             }
-          } catch (e) { fail(e); }
+          })(list[i]);
         }
-        function assign(t) {
-          for (var a = 1; a < arguments.length; a++) { var src = arguments[a]; for (var k in src) t[k] = src[k]; }
-          return t;
+        return pending.length ? Promise.all(pending).then(function () { return list; })
+          : Promise.resolve(list);
+      }
+      // Only an extension page can hold the registry, so only an extension page answers.
+      // A content script never registers user scripts, and an extra onMessage listener
+      // there is both useless and visible to the extension's own message plumbing.
+      // chrome.scripting is not the test to use: the shim backfills it everywhere.
+      var isExtensionPage = false;
+      try {
+        isExtensionPage = /^(safari-web-extension|chrome-extension|moz-extension):$/
+          .test((typeof location !== "undefined" && location.protocol) || "");
+      } catch (e) {}
+      try {
+        if (isExtensionPage && chrome.runtime && chrome.runtime.onMessage && typeof chrome.runtime.onMessage.addListener === "function") {
+          chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+            var req = msg && msg.__viaductUserScripts;
+            if (!req || !req.url) return;
+            var list = collectFor(req.url, req.top !== false);
+            resolveFiles(list).then(function (l) {
+              if (l.length) usLog("serving " + l.length + " script(s) to " + req.url);
+              try { sendResponse({ scripts: l }); } catch (e) {}
+            });
+            return true;
+          });
         }
-      }
-      // Wired at shim load, NOT on the first register(): Safari only delivers events to
-      // listeners a non-persistent background registered synchronously at startup, so a
-      // listener added later during async init never fires. Every context runs this,
-      // which is harmless: the registry is per-context and only a background ever calls
-      // register(), so anywhere else it stays empty and the listener does nothing.
-      //
-      // BOTH navigation signals are wired, not the first one that exists. Which of them
-      // Safari actually delivers is not something to bet a feature on, and betting on
-      // webNavigation.onCommitted alone left userscripts dead with nothing in the log.
-      // Double delivery is handled by the dedupe below rather than by picking a winner.
-      var wired = false;
-      function wireInjection() {
-        if (wired) return;
-        wired = true;
-        var signals = [];
-        // webNavigation is the better signal (per frame, and early enough for
-        // document_start), so once it has actually delivered something, stop listening
-        // to the coarser one. Until then tabs.onUpdated is the safety net.
-        var sawCommitted = false;
-        var live = function (ev) { return !!(ev && typeof ev.addListener === "function" && !ev.__c2sInert); };
-        try {
-          if (chrome.webNavigation && live(chrome.webNavigation.onCommitted)) {
-            chrome.webNavigation.onCommitted.addListener(function (d) {
-              if (!d) return;
-              sawCommitted = true;
-              injectFrame(d.tabId, d.frameId, d.url);
-            });
-            signals.push("webNavigation.onCommitted");
-          }
-        } catch (e) {}
-        try {
-          if (chrome.tabs && live(chrome.tabs.onUpdated)) {
-            // No status filter: Safari does not have to report changeInfo.status, and
-            // gating on "loading" threw away the only navigation signal that fires. A
-            // URL is enough, and the dedupe below absorbs the repeats a chatty
-            // onUpdated produces.
-            chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
-              if (sawCommitted) return;
-              var url = (info && info.url) || (tab && tab.url);
-              if (url) injectFrame(tabId, null, url);
-            });
-            signals.push("tabs.onUpdated");
-          }
-        } catch (e) {}
-        usLog("navigation signals: " + (signals.join(", ") || "NONE — user scripts cannot run"));
-      }
-      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
-      // No scripting API means nothing could be injected anyway (content scripts).
-      if (chrome.scripting && chrome.scripting.executeScript) wireInjection();
+      } catch (e) {}
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /
