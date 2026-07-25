@@ -718,12 +718,17 @@ const PAGE_WORLD_INJECT_RE =
 /**
  * Give chrome.userScripts a way to actually reach the page.
  *
- * Safari delivers no navigation events to a converted background page (neither
- * tabs.onUpdated nor webNavigation.onCommitted, verified live), so the shim's
- * userScripts registry has no way to inject on its own. A DECLARED content script does
- * run, so wire one that reports its URL to the background and evaluates whatever the
- * registry says matches. It runs in the isolated world, where chrome.runtime is
- * available for a manager's own bridge.
+ * The shim's userScripts registry has no way to inject on its own: it lives in the
+ * background, and the background cannot reach a page uninvited. A DECLARED content
+ * script does run, so wire one that reads the published registry out of storage and
+ * evaluates whatever matches its URL. It runs in the isolated world, where
+ * chrome.runtime is available for a manager's own bridge.
+ *
+ * Storage rather than messaging, deliberately: runtime.sendMessage broadcasts to every
+ * listener and the first sendResponse wins, and an extension's own background handler
+ * consumed the request and answered with nothing (live, Tampermonkey). Storage also
+ * survives the background being torn down, so a document_start injector that runs
+ * before the background has woken still finds the scripts.
  *
  * Only wired when the extension declares the userScripts permission, so nothing else
  * gains a content script it never asked for. Call BEFORE transformManifest, which
