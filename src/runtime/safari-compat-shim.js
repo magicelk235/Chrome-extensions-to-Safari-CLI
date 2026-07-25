@@ -4473,7 +4473,6 @@ var __C2S_DEBUG__ = false;
             if (scripts[s.id]) return rejectOrCb(new Error("Duplicate script id: " + s.id), cb);
           }
           for (var j = 0; j < arr.length; j++) scripts[arr[j].id] = shallowCopy(arr[j]);
-          wireInjection();
           return dual(undefined, cb);
         },
         unregister: function (filter, cb) {
@@ -4580,26 +4579,31 @@ var __C2S_DEBUG__ = false;
           if (code) run(assign({}, base, { func: userScriptRunner, args: [code, id] }));
         }
         function run(opts) {
+          var fail = function (e) { try { console.error("[viaduct] user-script injection failed:", e); } catch (e2) {} };
           try {
             var p = chrome.scripting.executeScript(opts);
             if (p && typeof p.catch === "function") {
-              p.catch(function () {
+              p.catch(function (e) {
                 // A MAIN-world refusal (missing support, or the page's CSP) still leaves
                 // the isolated world, where the script at least sees the DOM.
-                if (opts.world !== "MAIN") return;
+                if (opts.world !== "MAIN") return fail(e);
                 var iso = assign({}, opts); delete iso.world;
-                try { var q = chrome.scripting.executeScript(iso); if (q && q.catch) q.catch(function () {}); } catch (e) {}
+                try { var q = chrome.scripting.executeScript(iso); if (q && q.catch) q.catch(fail); } catch (e2) { fail(e2); }
               });
             }
-          } catch (e) {}
+          } catch (e) { fail(e); }
         }
         function assign(t) {
           for (var a = 1; a < arguments.length; a++) { var src = arguments[a]; for (var k in src) t[k] = src[k]; }
           return t;
         }
       }
-      // Wired on the first register() — only a background context registers scripts,
-      // so this needs no context sniffing.
+      // Wired at shim load, NOT on the first register(): Safari only delivers events to
+      // listeners a non-persistent background registered synchronously at startup, so a
+      // listener added later during async init never fires (proven live — Tampermonkey
+      // registered its scripts and no navigation ever reached them). Every context runs
+      // this, which is harmless: the registry is per-context and only a background ever
+      // calls register(), so anywhere else it stays empty and the listener does nothing.
       var wired = false;
       function wireInjection() {
         if (wired) return;
@@ -4621,6 +4625,8 @@ var __C2S_DEBUG__ = false;
           });
         } catch (e) {}
       }
+      // No scripting API means nothing could be injected anyway (content scripts).
+      if (chrome.scripting && chrome.scripting.executeScript) wireInjection();
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /

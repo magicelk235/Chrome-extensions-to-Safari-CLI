@@ -46,10 +46,9 @@ function boot() {
   vm.createContext(sandbox);
   vm.runInContext(shimSource(), sandbox);
   const navigate = (url, { tabId = 7, frameId = 0 } = {}) => {
-    assert.ok(navListeners.length > 0, "registering a script must wire a navigation listener");
     for (const fn of navListeners) fn({ tabId, frameId, url });
   };
-  return { sandbox, injected, navigate };
+  return { sandbox, injected, navigate, navListeners, tabListeners };
 }
 
 // Tampermonkey's real shape.
@@ -61,6 +60,17 @@ const userScript = (over = {}) => ({
   world: "USER_SCRIPT",
   allFrames: false,
   ...over,
+});
+
+test("the navigation listener is wired at load, not by register()", async () => {
+  // Safari only delivers events to listeners a non-persistent background registered
+  // synchronously at startup. Wiring on the first register() call, which happens later
+  // during async init, produced a listener that never fired once, live.
+  const { sandbox, navListeners } = boot();
+  const atLoad = navListeners.length;
+  assert.ok(atLoad > 0, "shim load must wire a navigation listener");
+  await sandbox.chrome.userScripts.register([userScript()]);
+  assert.equal(navListeners.length, atLoad, "register() must not be what wires it");
 });
 
 test("a registered user script is injected on a matching navigation", async () => {
