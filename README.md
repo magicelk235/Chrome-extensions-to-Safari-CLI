@@ -333,6 +333,16 @@ cp -R "<AppName>_Safari/<AppName>.app" ~/Applications/
 open "~/Applications/<AppName>.app"
 ```
 
+## Tested extensions
+
+Dark Reader, Claude in Chrome, and TWP (Translate Web Pages) are verified
+working on the current build. Grammarly, LastPass, and several others were
+verified in an earlier round and are due a re-check. The wiki keeps the full
+list, including what was actually exercised in Safari and what is still
+untested: [Tested Extensions][tested].
+
+[tested]: https://github.com/magicelk235/Viaduct-CLI/wiki/Tested-Extensions
+
 ## Limitations
 
 - **Ad/content blockers built on blocking `webRequest` (e.g. full uBlock

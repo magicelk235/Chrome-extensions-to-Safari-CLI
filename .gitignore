@@ -50,4 +50,8 @@ test extensions/
 # Tests, per-extension reports, and project notes — kept local, not pushed
 test/
 reports/
+docs/
 CLAUDE.md
+
+# GitHub wiki clone (its own repo, pushed separately)
+wiki/
