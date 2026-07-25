@@ -4550,14 +4550,28 @@ var __C2S_DEBUG__ = false;
         try { (0, eval)(code); }
         catch (e) { try { console.error("[viaduct] user script " + id + " failed:", e); } catch (e2) {} }
       }
+      // The two navigation signals both fire for one navigation, so remember what was
+      // injected recently and skip the repeat. Keyed by time, not URL: a reload is the
+      // same URL and must inject again.
+      var recent = {};
+      var DEDUPE_MS = 1000;
       function injectFrame(tabId, frameId, url) {
         if (!chrome.scripting || !chrome.scripting.executeScript || tabId == null || !url) return;
-        for (var id in scripts) {
+        var ids = Object.keys(scripts);
+        if (!ids.length) return;
+        var considered = 0;
+        for (var n = 0; n < ids.length; n++) {
+          var id = ids[n];
           var rec = scripts[id];
           if (!rec) continue;
           // A subframe navigation only runs the scripts that asked for all frames.
           if (frameId != null && frameId !== 0 && !rec.allFrames) continue;
           if (!appliesTo(rec, url)) continue;
+          var key = tabId + "|" + (frameId || 0) + "|" + id + "|" + url;
+          var now = Date.now();
+          if (recent[key] && now - recent[key] < DEDUPE_MS) continue;
+          recent[key] = now;
+          considered++;
           var files = [], code = "";
           var js = Array.isArray(rec.js) ? rec.js : [];
           for (var i = 0; i < js.length; i++) {
@@ -4578,6 +4592,8 @@ var __C2S_DEBUG__ = false;
           if (files.length) run(assign({}, base, { files: files }));
           if (code) run(assign({}, base, { func: userScriptRunner, args: [code, id] }));
         }
+        if (!considered) usLog("no script matched " + url + " (" + ids.length + " registered)");
+        else usLog("injecting " + considered + " script(s) into " + url);
         function run(opts) {
           var fail = function (e) { try { console.error("[viaduct] user-script injection failed:", e); } catch (e2) {} };
           try {
@@ -4600,31 +4616,45 @@ var __C2S_DEBUG__ = false;
       }
       // Wired at shim load, NOT on the first register(): Safari only delivers events to
       // listeners a non-persistent background registered synchronously at startup, so a
-      // listener added later during async init never fires (proven live — Tampermonkey
-      // registered its scripts and no navigation ever reached them). Every context runs
-      // this, which is harmless: the registry is per-context and only a background ever
-      // calls register(), so anywhere else it stays empty and the listener does nothing.
+      // listener added later during async init never fires. Every context runs this,
+      // which is harmless: the registry is per-context and only a background ever calls
+      // register(), so anywhere else it stays empty and the listener does nothing.
+      //
+      // BOTH navigation signals are wired, not the first one that exists. Which of them
+      // Safari actually delivers is not something to bet a feature on, and betting on
+      // webNavigation.onCommitted alone left userscripts dead with nothing in the log.
+      // Double delivery is handled by the dedupe below rather than by picking a winner.
       var wired = false;
       function wireInjection() {
         if (wired) return;
         wired = true;
+        var signals = [];
+        // webNavigation is the better signal (per frame, and early enough for
+        // document_start), so once it has actually delivered something, stop listening
+        // to the coarser one. Until then tabs.onUpdated is the safety net.
+        var sawCommitted = false;
         try {
           if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
             chrome.webNavigation.onCommitted.addListener(function (d) {
-              if (d) injectFrame(d.tabId, d.frameId, d.url);
+              if (!d) return;
+              sawCommitted = true;
+              injectFrame(d.tabId, d.frameId, d.url);
             });
-            return;
+            signals.push("webNavigation.onCommitted");
           }
         } catch (e) {}
-        // No webNavigation permission: tabs.onUpdated is later and frame-blind, but it
-        // is the only other navigation signal available.
         try {
-          chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
-            if (!info || info.status !== "loading") return;
-            injectFrame(tabId, null, info.url || (tab && tab.url));
-          });
+          if (chrome.tabs && chrome.tabs.onUpdated) {
+            chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
+              if (sawCommitted || !info || info.status !== "loading") return;
+              injectFrame(tabId, null, info.url || (tab && tab.url));
+            });
+            signals.push("tabs.onUpdated");
+          }
         } catch (e) {}
+        usLog("navigation signals: " + (signals.join(", ") || "NONE — user scripts cannot run"));
       }
+      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
       // No scripting API means nothing could be injected anyway (content scripts).
       if (chrome.scripting && chrome.scripting.executeScript) wireInjection();
     })();

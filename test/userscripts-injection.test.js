@@ -181,6 +181,21 @@ test("updating the code changes what gets injected", async () => {
   assert.equal(injected[0].args[0], "window.__v = 2;");
 });
 
+test("one navigation delivered by both signals injects once", async () => {
+  const { sandbox, injected, navListeners, tabListeners } = boot();
+  assert.ok(navListeners.length > 0 && tabListeners.length > 0, "both signals must be wired");
+  await sandbox.chrome.userScripts.register([userScript()]);
+
+  // Safari may deliver either, both, or neither; the shim wires both and dedupes.
+  for (const fn of navListeners) fn({ tabId: 7, frameId: 0, url: "https://example.com/x" });
+  for (const fn of tabListeners) fn(7, { status: "loading", url: "https://example.com/x" }, {});
+  assert.equal(injected.length, 1, "the same navigation must not inject twice");
+
+  // A different URL in the same tab is a real navigation, not a duplicate.
+  for (const fn of navListeners) fn({ tabId: 7, frameId: 0, url: "https://example.com/y" });
+  assert.equal(injected.length, 2);
+});
+
 test("<all_urls> matches http and https", async () => {
   const { sandbox, injected, navigate } = boot();
   await sandbox.chrome.userScripts.register([userScript({ matches: ["<all_urls>"] })]);
