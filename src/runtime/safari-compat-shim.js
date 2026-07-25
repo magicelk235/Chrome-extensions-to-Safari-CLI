@@ -4628,6 +4628,15 @@ var __C2S_DEBUG__ = false;
             if (!total) return;
             var list = collectFor(req.url, req.top !== false);
             usLog("request from " + req.url + ": " + list.length + "/" + total + " registered script(s) match");
+            // Answer SYNCHRONOUSLY whenever possible. sendMessage broadcasts to every
+            // listener and the first sendResponse wins; this shim's listener is
+            // registered first (the shim loads ahead of the bundle), but answering from
+            // a promise handed the race to the extension's own handler, which replied
+            // with its own message shape and left the page believing it had no scripts
+            // to run. Only a file-backed entry needs the async path.
+            var needsFiles = false;
+            for (var f = 0; f < list.length; f++) { if (list[f].files.length) { needsFiles = true; break; } }
+            if (!needsFiles) { try { sendResponse({ scripts: list }); } catch (e) {} return; }
             resolveFiles(list).then(function (l) {
               try { sendResponse({ scripts: l }); } catch (e) {}
             });

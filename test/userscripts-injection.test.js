@@ -130,6 +130,27 @@ test("<all_urls> matches http and https", async () => {
   assert.deepEqual(ids(await ask("https://other.test/b")), ["tm-1"]);
 });
 
+test("the registry answers synchronously so another listener cannot win the race", async () => {
+  // sendMessage broadcasts to every listener and the FIRST sendResponse wins. This
+  // shim's listener is registered first, but it used to answer from a promise, so the
+  // extension's own handler replied first with its own shape and the page was told it
+  // had no scripts — live, that read as "received 0 script(s)".
+  const { sandbox, listeners } = boot();
+  await sandbox.chrome.userScripts.register([userScript()]);
+  let answeredDuringCall = false;
+  let resp;
+  const kept = listeners.some((fn) => {
+    const r = fn({ __viaductUserScripts: { url: "https://example.com/x", top: true } }, {}, (v) => {
+      answeredDuringCall = true;
+      resp = v;
+    });
+    return r === true;
+  });
+  assert.equal(answeredDuringCall, true, "the answer must arrive before the listener returns");
+  assert.equal(kept, false, "and it must not ask to keep the channel open");
+  assert.deepEqual(ids(resp), ["tm-1"]);
+});
+
 test("an extension page with no scripts abstains instead of answering empty", async () => {
   // onMessage reaches every extension page, each running this shim with its own
   // registry. A popup or options page answering first with an empty list tells the

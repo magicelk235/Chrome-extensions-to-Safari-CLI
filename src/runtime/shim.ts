@@ -779,9 +779,13 @@ export function wireUserScriptsContentScript(
             return;
           }
         } catch (e) {}
-        var list = (resp && resp.scripts) || [];
-        log("received " + list.length + " script(s)");
-        run(list);
+        if (!resp || !resp.scripts) {
+          // Another onMessage listener answered this first; its reply is not ours.
+          log("no answer from the registry (another listener replied: " + JSON.stringify(resp) + ")");
+          return;
+        }
+        log("received " + resp.scripts.length + " script(s)");
+        run(resp.scripts);
       }
     );
   } catch (e) { log("could not reach the background: " + ((e && e.message) || e)); }
