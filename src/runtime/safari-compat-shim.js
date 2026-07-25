@@ -4480,6 +4480,7 @@ var __C2S_DEBUG__ = false;
             if (scripts[s.id]) return rejectOrCb(new Error("Duplicate script id: " + s.id), cb);
           }
           for (var j = 0; j < arr.length; j++) scripts[arr[j].id] = shallowCopy(arr[j]);
+          publish();
           return dual(undefined, cb);
         },
         unregister: function (filter, cb) {
@@ -4487,12 +4488,14 @@ var __C2S_DEBUG__ = false;
           var ids = filter && filter.ids;
           if (ids && ids.length) { for (var i = 0; i < ids.length; i++) delete scripts[ids[i]]; }
           else scripts = {};
+          publish();
           return dual(undefined, cb);
         },
         update: function (list, cb) {
           var arr = Array.isArray(list) ? list : [];
           for (var i = 0; i < arr.length; i++) { var s = arr[i]; if (!s || !scripts[s.id]) return rejectOrCb(new Error("No script with id: " + (s && s.id)), cb); }
           for (var j = 0; j < arr.length; j++) { var u = arr[j]; var cur = scripts[u.id]; for (var k in u) cur[k] = u[k]; }
+          publish();
           return dual(undefined, cb);
         },
         getScripts: function (filter, cb) {
@@ -4508,71 +4511,20 @@ var __C2S_DEBUG__ = false;
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
       function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); }
 
-      // ── running the registry ────────────────────────────────────────────────
-      // Safari delivers NO navigation events to a converted background page: neither
-      // tabs.onUpdated nor webNavigation.onCommitted ever fired, with listeners
-      // registered at background load and again live from the inspector, on a page that
-      // was demonstrably awake. Both events read as present and non-inert, so there is
-      // no capability check that would have caught it. Registered user scripts therefore
-      // cannot be injected from a navigation listener at all.
-      //
-      // A DECLARED content script does run — that is how every working converted
-      // extension reaches the page — so viaduct injects one (see
-      // wireUserScriptsContentScript) that reports its URL and evaluates whatever the
-      // registry says matches. It runs in the isolated world, where chrome.runtime is
-      // available, which is what a manager's own GM-style bridge needs to reach its
-      // background.
-      var reCache = {};
-      function escapeRe(str) { return String(str).replace(/[.+^${}()|[\]\\?]/g, "\\$&"); }
-      function patternToRe(pattern) {
-        if (reCache[pattern] !== undefined) return reCache[pattern];
-        var re = null;
-        if (pattern === "<all_urls>") {
-          re = /^(?:https?|file|ftp):\/\//;
-        } else {
-          var m = /^(\*|[a-z][a-z0-9+.-]*):\/\/(\*|(?:\*\.)?[^/*]*)(\/.*)$/i.exec(pattern);
-          if (m) {
-            var scheme = m[1] === "*" ? "https?" : escapeRe(m[1]);
-            var host = m[2];
-            var hostRe = host === "*" ? "[^/]+"
-              : host.indexOf("*.") === 0 ? "(?:[^/]+\\.)?" + escapeRe(host.slice(2))
-              : escapeRe(host);
-            var pathRe = escapeRe(m[3]).replace(/\*/g, ".*");
-            try { re = new RegExp("^" + scheme + ":\\/\\/" + hostRe + pathRe + "$"); } catch (e) { re = null; }
-          }
-        }
-        reCache[pattern] = re;
-        return re;
-      }
-      function globToRe(glob) {
-        var key = "\u0000glob" + glob;
-        if (reCache[key] !== undefined) return reCache[key];
-        var re = null;
-        try { re = new RegExp("^" + escapeRe(glob).replace(/\*/g, ".*").replace(/\\\?/g, ".") + "$"); } catch (e) {}
-        reCache[key] = re;
-        return re;
-      }
-      function anyMatch(list, url, toRe) {
-        if (!list || !list.length) return false;
-        for (var i = 0; i < list.length; i++) { var re = toRe(list[i]); if (re && re.test(url)) return true; }
-        return false;
-      }
-      function appliesTo(rec, url) {
-        if (!anyMatch(rec.matches, url, patternToRe)) return false;
-        if (anyMatch(rec.excludeMatches, url, patternToRe)) return false;
-        if (rec.includeGlobs && rec.includeGlobs.length && !anyMatch(rec.includeGlobs, url, globToRe)) return false;
-        if (anyMatch(rec.excludeGlobs, url, globToRe)) return false;
-        return true;
-      }
-      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
-
-      function collectFor(url, isTop) {
+      // ── publishing the registry ─────────────────────────────────────────────
+      // The page side reads this out of storage rather than asking for it over
+      // runtime.sendMessage. That broadcast reaches every listener, the first
+      // sendResponse wins, and the extension's own background handler consumed the
+      // request and answered with nothing — twelve retries over three seconds never
+      // once got our reply through. Storage has neither a race nor a boot problem: it
+      // survives the background being torn down, so a content script that runs before
+      // the background has finished waking still finds the scripts.
+      var STORE_KEY = "__viaductUserScripts";
+      function publish() {
         var out = [];
         for (var id in scripts) {
           var rec = scripts[id];
           if (!rec) continue;
-          if (!isTop && !rec.allFrames) continue;
-          if (!appliesTo(rec, url)) continue;
           var js = Array.isArray(rec.js) ? rec.js : [];
           var code = "", files = [];
           for (var i = 0; i < js.length; i++) {
@@ -4580,15 +4532,16 @@ var __C2S_DEBUG__ = false;
             if (js[i].code) code += (code ? "\n;" : "") + js[i].code;
             else if (js[i].file) files.push(js[i].file);
           }
-          out.push({ id: id, code: code, files: files, runAt: rec.runAt });
+          out.push({
+            id: id, code: code, files: files, runAt: rec.runAt, allFrames: !!rec.allFrames,
+            matches: rec.matches || [], excludeMatches: rec.excludeMatches || [],
+            includeGlobs: rec.includeGlobs || [], excludeGlobs: rec.excludeGlobs || [],
+          });
         }
-        return out;
-      }
-      // File-backed entries are read here rather than in the page: the content script
-      // would have to fetch them as web-accessible resources, and they need not be.
-      function resolveFiles(list) {
+        // File-backed entries are read here, not in the page: they need not be
+        // web-accessible resources, so the page could not fetch them itself.
         var pending = [];
-        for (var i = 0; i < list.length; i++) {
+        for (var n = 0; n < out.length; n++) {
           (function (entry) {
             for (var f = 0; f < entry.files.length; f++) {
               (function (file) {
@@ -4600,50 +4553,20 @@ var __C2S_DEBUG__ = false;
                 } catch (e) {}
               })(entry.files[f]);
             }
-          })(list[i]);
+          })(out[n]);
         }
-        return pending.length ? Promise.all(pending).then(function () { return list; })
-          : Promise.resolve(list);
-      }
-      // Only an extension page can hold the registry, so only an extension page answers.
-      // A content script never registers user scripts, and an extra onMessage listener
-      // there is both useless and visible to the extension's own message plumbing.
-      // chrome.scripting is not the test to use: the shim backfills it everywhere.
-      var isExtensionPage = false;
-      try {
-        isExtensionPage = /^(safari-web-extension|chrome-extension|moz-extension):$/
-          .test((typeof location !== "undefined" && location.protocol) || "");
-      } catch (e) {}
-      try {
-        if (isExtensionPage && chrome.runtime && chrome.runtime.onMessage && typeof chrome.runtime.onMessage.addListener === "function") {
-          chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-            var req = msg && msg.__viaductUserScripts;
-            if (!req || !req.url) return;
-            // onMessage reaches EVERY extension page, and each one runs this shim with
-            // its own registry. Only the context that actually holds scripts may answer:
-            // a popup or options page would otherwise win the race with an empty list and
-            // the page would be told there is nothing to run.
-            var total = 0;
-            for (var k in scripts) total++;
-            if (!total) return;
-            var list = collectFor(req.url, req.top !== false);
-            usLog("request from " + req.url + ": " + list.length + "/" + total + " registered script(s) match");
-            // Answer SYNCHRONOUSLY whenever possible. sendMessage broadcasts to every
-            // listener and the first sendResponse wins; this shim's listener is
-            // registered first (the shim loads ahead of the bundle), but answering from
-            // a promise handed the race to the extension's own handler, which replied
-            // with its own message shape and left the page believing it had no scripts
-            // to run. Only a file-backed entry needs the async path.
-            var needsFiles = false;
-            for (var f = 0; f < list.length; f++) { if (list[f].files.length) { needsFiles = true; break; } }
-            if (!needsFiles) { try { sendResponse({ scripts: list }); } catch (e) {} return; }
-            resolveFiles(list).then(function (l) {
-              try { sendResponse({ scripts: l }); } catch (e) {}
+        var write = function () {
+          try {
+            var o = {}; o[STORE_KEY] = out;
+            chrome.storage.local.set(o, function () {
+              try { if (chrome.runtime.lastError) usLog("could not publish: " + chrome.runtime.lastError.message); } catch (e) {}
             });
-            return true;
-          });
-        }
-      } catch (e) {}
+            usLog("published " + out.length + " script(s) for the page injector");
+          } catch (e) { usLog("could not publish: " + ((e && e.message) || e)); }
+        };
+        if (pending.length) Promise.all(pending).then(write, write); else write();
+      }
+      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /

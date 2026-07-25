@@ -6,223 +6,225 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { shimSource, wireUserScriptsContentScript, USERSCRIPTS_CS_FILENAME } from "../dist/runtime/shim.js";
 
-// Safari delivers NO navigation events to a converted background page: neither
-// tabs.onUpdated nor webNavigation.onCommitted ever fired, with listeners registered at
-// background load and again live from the inspector, on a page that was demonstrably
-// awake, and both events report as present and non-inert so no capability check catches
-// it. So chrome.userScripts cannot inject from a navigation listener at all. A declared
-// content script does run — it is how every working converted extension reaches the page
-// — so it asks the background what matches its URL and evaluates that.
-function boot() {
+// chrome.userScripts has two halves on Safari: the background publishes its registry to
+// storage, and a declared content script reads it and evaluates what matches. It does
+// NOT go over runtime.sendMessage — that broadcast reaches every listener and the first
+// sendResponse wins, and live, Tampermonkey's own background handler consumed the
+// request and answered with nothing on all twelve retries. Storage also survives the
+// background being torn down, so a document_start injector that runs before the
+// background has woken still finds the scripts.
+const STORE_KEY = "__viaductUserScripts";
+
+/** The background half: run the shim, register scripts, capture what it stores. */
+function background() {
+  const stored = {};
   const sandbox = {
     console,
     setTimeout, clearTimeout, setInterval, clearInterval,
-    fetch: () => Promise.reject(new Error("no network in tests")),
+    fetch: (u) => Promise.resolve({ text: () => Promise.resolve(`/* ${u} */ window.__fromFile = true;`) }),
     location: { href: "safari-web-extension://TEST/background.html", protocol: "safari-web-extension:" },
     navigator: { userAgent: "test" },
     chrome: {
       runtime: {
         id: "test-ext",
         getURL: (p) => "safari-web-extension://TEST/" + p,
-        onMessage: { addListener: (fn) => listeners.push(fn), removeListener() {} },
+        onMessage: { addListener() {}, removeListener() {} },
         sendMessage() {},
+      },
+      storage: {
+        local: {
+          set(obj, cb) { Object.assign(stored, obj); cb && cb(); },
+          get(key, cb) { cb({ [key]: stored[key] }); },
+        },
       },
       scripting: { executeScript: () => Promise.resolve([]) },
     },
   };
-  const listeners = [];
   sandbox.window = sandbox;
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(shimSource(), sandbox);
+  return { sandbox, stored, published: () => stored[STORE_KEY] };
+}
 
-  // What the injected content script sends, and what it gets back.
-  const ask = (url, { top = true } = {}) =>
-    new Promise((resolve) => {
-      const msg = { __viaductUserScripts: { url, top } };
-      for (const fn of listeners) {
-        const kept = fn(msg, { id: "test-ext" }, resolve);
-        if (kept === true) return;
-      }
-      resolve(undefined);
-    });
-  return { sandbox, ask, listeners };
+/** The page half: run the generated injector against a published registry. */
+function page(published, { url = "https://example.com/page", isTop = true, readyState = "loading" } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "viaduct-us-"));
+  const original = { permissions: ["userScripts"] };
+  const transformed = { permissions: [] };
+  wireUserScriptsContentScript(dir, transformed, original);
+  const src = readFileSync(join(dir, USERSCRIPTS_CS_FILENAME), "utf-8");
+  rmSync(dir, { recursive: true, force: true });
+
+  const domReady = [];
+  const sandbox = {
+    console,
+    setTimeout, clearTimeout,
+    location: { href: url },
+    document: {
+      readyState,
+      addEventListener: (t, fn) => { if (t === "DOMContentLoaded") domReady.push(fn); },
+    },
+    chrome: {
+      runtime: { getURL: (p) => "safari-web-extension://TEST/" + p },
+      storage: { local: { get: (key, cb) => cb({ [key]: published }) } },
+    },
+  };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.top = isTop ? sandbox : {};
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox);
+  return { sandbox, fireDomReady: () => domReady.forEach((fn) => fn()) };
 }
 
 const userScript = (over = {}) => ({
   id: "tm-1",
   js: [{ code: "window.__ran = true;" }],
-  matches: ["https://example.com/*"],
+  matches: ["<all_urls>"],
   runAt: "document_start",
   world: "USER_SCRIPT",
-  allFrames: false,
+  allFrames: true,
   ...over,
 });
 
-// Array.from rebuilds it in this realm; the response is built inside the VM and its
-// foreign Array.prototype trips assert.deepEqual.
-const ids = (resp) => Array.from(resp.scripts || [], (s) => s.id).sort();
-
-test("the page is served the scripts that match its URL", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  const resp = await ask("https://example.com/page");
-  assert.deepEqual(ids(resp), ["tm-1"]);
-  assert.equal(resp.scripts[0].code, "window.__ran = true;");
-  assert.equal(resp.scripts[0].runAt, "document_start");
+test("registering publishes the script for the page to find", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript()]);
+  const out = bg.published();
+  assert.equal(out.length, 1);
+  assert.equal(out[0].id, "tm-1");
+  assert.equal(out[0].code, "window.__ran = true;");
+  assert.equal(out[0].allFrames, true);
 });
 
-test("a non-matching URL is served nothing", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  assert.deepEqual(ids(await ask("https://other.test/page")), []);
+test("end to end: a registered script actually runs on a matching page", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript()]);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__ran, true, "the userscript body must have executed in the page");
 });
 
-test("excludeMatches and excludeGlobs both suppress a match", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([
-    userScript({ id: "a", excludeMatches: ["https://example.com/admin/*"] }),
-    userScript({ id: "b", excludeGlobs: ["*/private/*"] }),
+test("end to end: Tampermonkey's real registration shape runs", async () => {
+  // Exactly what Tampermonkey registers, from a live getScripts() dump.
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([
+    { id: "3|content|wwywq+undefined|r|x", matches: ["<all_urls>"], allFrames: true,
+      runAt: "document_start", world: "USER_SCRIPT", js: [{ code: "window.__tmContent = 1;" }] },
+    { id: "1|page|wwywq+undefined", matches: ["<all_urls>"], allFrames: true,
+      runAt: "document_start", world: "USER_SCRIPT", js: [{ code: "window.__tmPage = 1;" }] },
   ]);
-  assert.deepEqual(ids(await ask("https://example.com/admin/panel")), ["b"]);
-  assert.deepEqual(ids(await ask("https://example.com/private/x")), ["a"]);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__tmContent, 1);
+  assert.equal(sandbox.__tmPage, 1);
 });
 
-test("includeGlobs narrow a match further", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript({ includeGlobs: ["*/wanted*"] })]);
-  assert.deepEqual(ids(await ask("https://example.com/nope")), []);
-  assert.deepEqual(ids(await ask("https://example.com/wanted/x")), ["tm-1"]);
+test("a page the script does not match runs nothing", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript({ matches: ["https://other.test/*"] })]);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__ran, undefined);
 });
 
-test("a subframe only gets the scripts that asked for all frames", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([
-    userScript({ id: "main-only", allFrames: false }),
-    userScript({ id: "all", allFrames: true }),
+test("excludeMatches and globs are honoured in the page", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([
+    userScript({ id: "excluded", matches: ["<all_urls>"], excludeMatches: ["https://example.com/*"],
+                 js: [{ code: "window.__excluded = true;" }] }),
+    userScript({ id: "globbed", matches: ["<all_urls>"], includeGlobs: ["*/other*"],
+                 js: [{ code: "window.__globbed = true;" }] }),
   ]);
-  assert.deepEqual(ids(await ask("https://example.com/x", { top: false })), ["all"]);
-  assert.deepEqual(ids(await ask("https://example.com/x")), ["all", "main-only"]);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__excluded, undefined);
+  assert.equal(sandbox.__globbed, undefined);
 });
 
-test("unregistering stops it being served", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  await sandbox.chrome.userScripts.unregister({ ids: ["tm-1"] });
-  // Nothing left to hold, so this context abstains entirely rather than answering
-  // empty and shouting down a context that does hold scripts.
-  assert.equal(await ask("https://example.com/x"), undefined);
+test("a subframe only runs the scripts that asked for all frames", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([
+    userScript({ id: "main-only", allFrames: false, js: [{ code: "window.__mainOnly = true;" }] }),
+    userScript({ id: "all", allFrames: true, js: [{ code: "window.__all = true;" }] }),
+  ]);
+  const { sandbox } = page(bg.published(), { isTop: false });
+  assert.equal(sandbox.__mainOnly, undefined);
+  assert.equal(sandbox.__all, true);
 });
 
-test("updating the code changes what is served", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  await sandbox.chrome.userScripts.update([{ id: "tm-1", js: [{ code: "window.__v = 2;" }] }]);
-  const resp = await ask("https://example.com/x");
-  assert.equal(resp.scripts[0].code, "window.__v = 2;");
+test("document_idle waits for DOMContentLoaded", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([
+    userScript({ runAt: "document_idle", js: [{ code: "window.__late = true;" }] }),
+  ]);
+  const { sandbox, fireDomReady } = page(bg.published(), { readyState: "loading" });
+  assert.equal(sandbox.__late, undefined, "must not run before the DOM is ready");
+  fireDomReady();
+  assert.equal(sandbox.__late, true);
 });
 
-test("<all_urls> matches http and https", async () => {
-  const { sandbox, ask } = boot();
-  await sandbox.chrome.userScripts.register([userScript({ matches: ["<all_urls>"] })]);
-  assert.deepEqual(ids(await ask("http://anything.test/a")), ["tm-1"]);
-  assert.deepEqual(ids(await ask("https://other.test/b")), ["tm-1"]);
+test("file-backed scripts are read in the background, where they are reachable", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript({ js: [{ file: "us.js" }] })]);
+  await new Promise((r) => setTimeout(r, 10)); // the fetch is async
+  const out = bg.published();
+  assert.match(out[0].code, /__fromFile/, "the file's text must be inlined for the page");
 });
 
-test("the registry answers synchronously so another listener cannot win the race", async () => {
-  // sendMessage broadcasts to every listener and the FIRST sendResponse wins. This
-  // shim's listener is registered first, but it used to answer from a promise, so the
-  // extension's own handler replied first with its own shape and the page was told it
-  // had no scripts — live, that read as "received 0 script(s)".
-  const { sandbox, listeners } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  let answeredDuringCall = false;
-  let resp;
-  const kept = listeners.some((fn) => {
-    const r = fn({ __viaductUserScripts: { url: "https://example.com/x", top: true } }, {}, (v) => {
-      answeredDuringCall = true;
-      resp = v;
-    });
-    return r === true;
-  });
-  assert.equal(answeredDuringCall, true, "the answer must arrive before the listener returns");
-  assert.equal(kept, false, "and it must not ask to keep the channel open");
-  assert.deepEqual(ids(resp), ["tm-1"]);
+test("unregistering removes it from what the page can find", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript()]);
+  await bg.sandbox.chrome.userScripts.unregister({ ids: ["tm-1"] });
+  assert.equal(bg.published().length, 0);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__ran, undefined);
 });
 
-test("an extension page with no scripts abstains instead of answering empty", async () => {
-  // onMessage reaches every extension page, each running this shim with its own
-  // registry. A popup or options page answering first with an empty list tells the
-  // content script there is nothing to run, even though the background holds the
-  // scripts — live, that is exactly what produced "received 0 script(s)".
-  const { listeners } = boot(); // nothing registered in this context
-  let answered = false;
-  const kept = listeners.some(
-    (fn) => fn({ __viaductUserScripts: { url: "https://example.com/x", top: true } }, {}, () => { answered = true; }) === true,
-  );
-  assert.equal(kept, false, "an empty context must not keep the channel open");
-  assert.equal(answered, false, "and must not answer");
+test("updating the code changes what the page runs", async () => {
+  const bg = background();
+  await bg.sandbox.chrome.userScripts.register([userScript()]);
+  await bg.sandbox.chrome.userScripts.update([{ id: "tm-1", js: [{ code: "window.__v = 2;" }] }]);
+  const { sandbox } = page(bg.published());
+  assert.equal(sandbox.__v, 2);
 });
 
-test("a message that isn't ours is left alone for the extension's own handlers", async () => {
-  const { sandbox, listeners } = boot();
-  await sandbox.chrome.userScripts.register([userScript()]);
-  let answered = false;
-  // Keeping the channel open (returning true) for someone else's message would stall
-  // their sendResponse; answering it would corrupt their reply.
-  const kept = listeners.some((fn) => fn({ hello: "world" }, {}, () => { answered = true; }) === true);
-  assert.equal(kept, false);
-  assert.equal(answered, false);
-});
-
-// ── the injector viaduct writes into the bundle ────────────────────────────────
-function stageDir() {
-  return mkdtempSync(join(tmpdir(), "viaduct-us-"));
-}
-
+// ── how the injector gets into the bundle ──────────────────────────────────────
 test("the injector is wired only for an extension that asked for userScripts", () => {
-  const dir = stageDir();
+  const dir = mkdtempSync(join(tmpdir(), "viaduct-us-"));
   try {
     const plain = { permissions: ["storage"] };
     assert.equal(wireUserScriptsContentScript(dir, plain, plain), null);
     assert.equal(existsSync(join(dir, USERSCRIPTS_CS_FILENAME)), false);
-    assert.equal(plain.content_scripts, undefined, "no extension gains a content script it never asked for");
+    assert.equal(plain.content_scripts, undefined);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("the injector is declared at document_start in all frames", () => {
-  const dir = stageDir();
+  const dir = mkdtempSync(join(tmpdir(), "viaduct-us-"));
   try {
-    // transformManifest strips userScripts for Safari, so the check reads the original.
     const original = { permissions: ["userScripts", "scripting"] };
     const transformed = { permissions: ["scripting"] };
     assert.equal(wireUserScriptsContentScript(dir, transformed, original), USERSCRIPTS_CS_FILENAME);
-
     const entry = transformed.content_scripts.find((cs) => cs.js.includes(USERSCRIPTS_CS_FILENAME));
-    assert.ok(entry, "the injector must be declared");
+    assert.ok(entry);
     assert.deepEqual(entry.matches, ["<all_urls>"]);
     assert.equal(entry.run_at, "document_start");
     assert.equal(entry.all_frames, true);
-
-    const src = readFileSync(join(dir, USERSCRIPTS_CS_FILENAME), "utf-8");
-    assert.match(src, /__viaductUserScripts/, "it must ask the background for its scripts");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("re-wiring the same bundle does not declare it twice", () => {
-  const dir = stageDir();
+  const dir = mkdtempSync(join(tmpdir(), "viaduct-us-"));
   try {
     const original = { permissions: ["userScripts"] };
     const transformed = { permissions: [] };
     wireUserScriptsContentScript(dir, transformed, original);
     wireUserScriptsContentScript(dir, transformed, original);
-    const entries = transformed.content_scripts.filter((cs) => cs.js.includes(USERSCRIPTS_CS_FILENAME));
-    assert.equal(entries.length, 1);
+    assert.equal(transformed.content_scripts.filter((cs) => cs.js.includes(USERSCRIPTS_CS_FILENAME)).length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

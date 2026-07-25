@@ -741,16 +741,53 @@ export function wireUserScriptsContentScript(
   if (!perms.includes("userScripts")) return null;
 
   const js = `// Injected by viaduct: runs the scripts registered through chrome.userScripts.
-// Safari fires no navigation event the background could inject from, so the page asks.
+// The registry is read from storage, not requested over runtime.sendMessage: that
+// broadcast reaches every listener, the first sendResponse wins, and the extension's own
+// background handler consumed the request and answered with nothing. Storage also has no
+// boot race — it outlives the background being torn down, so this still finds the scripts
+// when it runs before the background has finished waking.
 (function () {
   if (window.__viaductUserScriptsRan) return;
   window.__viaductUserScriptsRan = true;
+  var STORE_KEY = "__viaductUserScripts";
+  function log(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
+
+  function escapeRe(str) { return String(str).replace(/[.+^\${}()|[\\]\\\\?]/g, "\\\\$&"); }
+  function patternToRe(pattern) {
+    if (pattern === "<all_urls>") return /^(?:https?|file|ftp):\\/\\//;
+    var m = /^(\\*|[a-z][a-z0-9+.-]*):\\/\\/(\\*|(?:\\*\\.)?[^/*]*)(\\/.*)\$/i.exec(pattern);
+    if (!m) return null;
+    var scheme = m[1] === "*" ? "https?" : escapeRe(m[1]);
+    var host = m[2];
+    var hostRe = host === "*" ? "[^/]+"
+      : host.indexOf("*.") === 0 ? "(?:[^/]+\\\\.)?" + escapeRe(host.slice(2))
+      : escapeRe(host);
+    var pathRe = escapeRe(m[3]).replace(/\\*/g, ".*");
+    try { return new RegExp("^" + scheme + ":\\\\/\\\\/" + hostRe + pathRe + "\$"); } catch (e) { return null; }
+  }
+  function globToRe(glob) {
+    try { return new RegExp("^" + escapeRe(glob).replace(/\\*/g, ".*").replace(/\\\\\\?/g, ".") + "\$"); }
+    catch (e) { return null; }
+  }
+  function anyMatch(list, url, toRe) {
+    if (!list || !list.length) return false;
+    for (var i = 0; i < list.length; i++) { var re = toRe(list[i]); if (re && re.test(url)) return true; }
+    return false;
+  }
+  function appliesTo(rec, url, isTop) {
+    if (!isTop && !rec.allFrames) return false;
+    if (!anyMatch(rec.matches, url, patternToRe)) return false;
+    if (anyMatch(rec.excludeMatches, url, patternToRe)) return false;
+    if (rec.includeGlobs && rec.includeGlobs.length && !anyMatch(rec.includeGlobs, url, globToRe)) return false;
+    if (anyMatch(rec.excludeGlobs, url, globToRe)) return false;
+    return true;
+  }
+
   function exec(s) {
     try { (0, eval)(s.code); }
     catch (e) { try { console.error("[viaduct] user script " + s.id + " failed:", e); } catch (e2) {} }
   }
   function run(list) {
-    if (!list || !list.length) return;
     var later = [];
     for (var i = 0; i < list.length; i++) {
       var s = list[i];
@@ -764,40 +801,29 @@ export function wireUserScriptsContentScript(
       });
     }
   }
-  // Logged from the page's own console, which is the only place an isolated-world
-  // content script is observable from outside. Reading a flag off window does not work:
-  // the page console evaluates in the page world and never sees this one.
-  function log(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
-  // The background is non-persistent and this runs at document_start, so the registry
-  // is often not populated yet: the extension re-registers its scripts while its
-  // background is still booting. A context holding no scripts stays silent rather than
-  // answering empty, so silence means "ask again shortly", not "nothing to run".
-  var attempts = 0;
-  var MAX_ATTEMPTS = 12;
-  var RETRY_MS = 250;
-  function requestScripts() {
+
+  // The background may not have registered anything yet when this runs, so poll briefly.
+  var attempts = 0, MAX_ATTEMPTS = 12, RETRY_MS = 250;
+  var url = location.href, isTop = window.top === window;
+  function load() {
     attempts++;
-    var retry = function (why) {
-      if (attempts < MAX_ATTEMPTS) { setTimeout(requestScripts, RETRY_MS); return; }
-      log("gave up after " + attempts + " attempts: " + why);
-    };
     try {
-      chrome.runtime.sendMessage(
-        { __viaductUserScripts: { url: location.href, top: window.top === window } },
-        function (resp) {
-          try {
-            if (chrome.runtime.lastError) return retry("no listener (" + chrome.runtime.lastError.message + ")");
-          } catch (e) {}
-          // A reply without our shape came from someone else's onMessage handler.
-          if (!resp || !resp.scripts) return retry("answered by another listener: " + JSON.stringify(resp));
-          log("received " + resp.scripts.length + " script(s) after " + attempts + " attempt(s)");
-          run(resp.scripts);
+      chrome.storage.local.get(STORE_KEY, function (res) {
+        var all = (res && res[STORE_KEY]) || [];
+        if (!all.length) {
+          if (attempts < MAX_ATTEMPTS) { setTimeout(load, RETRY_MS); return; }
+          log("no scripts published after " + attempts + " attempts");
+          return;
         }
-      );
-    } catch (e) { retry("send failed: " + ((e && e.message) || e)); }
+        var mine = [];
+        for (var i = 0; i < all.length; i++) if (appliesTo(all[i], url, isTop)) mine.push(all[i]);
+        log("running " + mine.length + " of " + all.length + " published script(s)");
+        run(mine);
+      });
+    } catch (e) { log("could not read the registry: " + ((e && e.message) || e)); }
   }
-  log("injector running on " + location.href);
-  requestScripts();
+  log("injector running on " + url);
+  load();
 })();
 `;
   writeFileSync(join(dir, USERSCRIPTS_CS_FILENAME), js, "utf-8");
