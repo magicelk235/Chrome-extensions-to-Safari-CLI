@@ -5514,8 +5514,56 @@ var __C2S_DEBUG__ = false;
       // sweep orphaned mailbox records on init (and shortly after) so a store bloated by
       // past sessions doesn't stall this open's request delivery.
       try { sweepStale(); setTimeout(sweepStale, 2000); setTimeout(scanPending, 400); setTimeout(scanPending, 1500); setTimeout(scanPending, 4000); } catch (e) {}
-      if (nativeChrome) __publishGlobal("chrome", wrap(nativeChrome));
-      if (nativeBrowser) __publishGlobal("browser", wrap(nativeBrowser));
+      // Replacing an EXTENSION PAGE's global api object with a Proxy makes Safari stop
+      // delivering content-script messages to that page entirely — bisected live: a
+      // background page that only differed by this swap received nothing, and a listener
+      // registered on the pristine native event BEFORE the swap stopped receiving too.
+      // So Safari resolves deliverability against the page's current global at dispatch
+      // time, and swapping it detaches the page. That silently broke every converted
+      // extension whose content scripts message the background (Cloaked's login tokens
+      // travel exactly that path).
+      //
+      // The two members the relay needs can be patched in place instead — installOverride
+      // falls back to defineProperty, which Safari permits on these slots — and that
+      // leaves the global identity, and therefore native delivery, alone. Content scripts
+      // keep the old swap: it is harmless there (verified: sending still works) and it
+      // carries the runtime.id spoof, which an in-place patch cannot (frozen slot).
+      // The EVENT OBJECT's identity is what has to survive: replacing runtime.onMessage
+      // with a facade breaks delivery exactly as swapping the global did (both bisected
+      // live). Wrapping addListener in place keeps the object Safari dispatches through
+      // while still recording each listener for the storage relay.
+      var captureListeners = function (base) {
+        var ev = base.runtime && base.runtime.onMessage;
+        if (!ev || typeof ev.addListener !== "function") return false;
+        var nAdd = ev.addListener.bind(ev);
+        var nRemove = typeof ev.removeListener === "function" ? ev.removeListener.bind(ev) : null;
+        var ok = installOverride(ev, "addListener", function (fn) {
+          if (typeof fn !== "function") return;
+          if (listeners.indexOf(fn) < 0) listeners.push(fn);
+          try { nAdd(fn); } catch (e) {}
+          // A relayed request may already be sitting in storage from before this
+          // listener existed.
+          scanPending();
+        });
+        if (ok && nRemove) {
+          installOverride(ev, "removeListener", function (fn) {
+            var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1);
+            try { nRemove(fn); } catch (e) {}
+          });
+        }
+        return ok;
+      };
+      var applyRelay = function (base, name) {
+        if (!base || !base.runtime) return;
+        if (!__relayExtPage) { __publishGlobal(name, wrap(base)); return; }
+        var okOn = captureListeners(base);
+        var okSend = installOverride(base.runtime, "sendMessage", bridgeSend);
+        // A page with no relay is worse than one with degraded native delivery, so fall
+        // back to the swap wherever the platform refuses the in-place patch.
+        if (!okOn || !okSend) __publishGlobal(name, wrap(base));
+      };
+      if (nativeChrome) applyRelay(nativeChrome, "chrome");
+      if (nativeBrowser) applyRelay(nativeBrowser, "browser");
     } catch (e) {}
   })();
 
