@@ -4050,12 +4050,70 @@ var __C2S_DEBUG__ = false;
       create: function (opts, cb) {
         var url = opts && opts.url;
         try { if (url && chrome.tabs && chrome.tabs.create) chrome.tabs.create({ url: Array.isArray(url) ? url[0] : url }); } catch (e) {}
-        return dual({ id: -1, tabs: [] }, cb);
+        return dual({ id: -1, tabs: [{ id: -1, index: 0, windowId: -1, active: true, url: Array.isArray(url) ? url[0] : (url || "") }] }, cb);
       },
       update: function (id, info, cb) { return dual({ id: id }, cb); },
       remove: function (id, cb) { return dual(undefined, cb); },
       onCreated: event(), onRemoved: event(), onFocusChanged: event(), onBoundsChanged: event(),
     });
+
+    // Chrome's windows.create resolves a Window whose `tabs` array is populated;
+    // Safari's native create resolves the Window with `tabs` undefined. Auth flows
+    // that open a login window read the new tab straight off the result and treat a
+    // missing one as a hard failure — live: Cloaked's "Log in" throws "Created window
+    // has no tabs available", the popup has already called window.close(), and the
+    // user is left with a spinner that vanishes and no login. Backfill `tabs` from a
+    // tabs.query on the new window id. fill() above can't cover this: the method
+    // EXISTS on macOS, it just under-reports.
+    (function () {
+      var orig = chrome.windows && chrome.windows.create;
+      if (typeof orig !== "function" || chrome.windows.__c2sCreateWrapped) return;
+      chrome.windows.__c2sCreateWrapped = true;
+      chrome.windows.create = function (opts, cb) {
+        var self = this;
+        var call = function (o) {
+          try {
+            var r = orig.call(self, o);
+            return (r && typeof r.then === "function") ? r : Promise.resolve(r);
+          } catch (e) { return Promise.reject(e); }
+        };
+        var p = call(opts).catch(function (err) {
+          // Safari rejects window types it doesn't render ("popup"/"panel"). A login
+          // window in a normal window beats no login window, so drop the type and retry.
+          if (opts && opts.type && opts.type !== "normal") {
+            var o2 = {}; for (var k in opts) { if (k !== "type") o2[k] = opts[k]; }
+            return call(o2);
+          }
+          throw err;
+        });
+        p = p.then(function (w) {
+          if (!w || (w.tabs && w.tabs.length)) return w;
+          var url = opts && opts.url;
+          var stub = [{ id: -1, index: 0, windowId: (w && typeof w.id === "number") ? w.id : -1,
+                        active: true, url: Array.isArray(url) ? url[0] : (url || "") }];
+          if (!(chrome.tabs && chrome.tabs.query) || typeof w.id !== "number") {
+            try { w.tabs = stub; } catch (e) {}
+            return w;
+          }
+          return new Promise(function (res) {
+            var settled = false;
+            var settle = function (tabs) {
+              if (settled) return;
+              settled = true;
+              // Never hand back a Window with no tabs: callers index tabs[0] directly.
+              try { w.tabs = (tabs && tabs.length) ? tabs : stub; } catch (e) {}
+              res(w);
+            };
+            try {
+              var q = chrome.tabs.query({ windowId: w.id }, settle);
+              if (q && typeof q.then === "function") q.then(settle, function () { settle(null); });
+            } catch (e) { settle(null); }
+          });
+        });
+        if (typeof cb === "function") { p.then(function (v) { try { cb(v); } catch (e) {} }, function () {}); return; }
+        return p;
+      };
+    })();
 
     // chrome.devtools — DevTools-page extensions (devtools_page in the manifest)
     // have NO Safari equivalent; the panels/network/inspectedWindow surface is
