@@ -4024,6 +4024,88 @@ var __C2S_DEBUG__ = false;
       onReferenceFragmentUpdated: event(), onTabReplaced: event(), onHistoryStateUpdated: event(),
     });
 
+    // Safari never fires onHistoryStateUpdated / onReferenceFragmentUpdated, and an inert
+    // backfill is indistinguishable from a real event that just hasn't fired yet — so a
+    // bundle that keys real work off SPA navigation stalls with nothing logged. Live:
+    // Cloaked installs its page↔extension bridge from onHistoryStateUpdated on
+    // my.cloaked.com (a Vue app), so after login the dashboard's postMessage had no
+    // listener and the extension never received the session.
+    //
+    // The signal is taken from the CONTENT SCRIPT, not from tabs.onUpdated. Measured on
+    // Safari 26: a converted background page receives no tabs.onUpdated and no
+    // webNavigation.onCommitted at all, on either the chrome or the browser namespace,
+    // for a full load or an in-page click, with <all_urls> granted. Nothing background-
+    // side is a foundation to build on. The content script sits where the navigation
+    // actually happens, so it hooks pushState/replaceState/popstate/hashchange and
+    // relays up; the background turns each relay back into the Chrome event shape.
+    // tabs.onUpdated stays wired as a second source for hosts that do deliver it.
+    if (chrome.webNavigation.onHistoryStateUpdated && chrome.webNavigation.onHistoryStateUpdated.__c2sInert) {
+      var histEv = eventList();
+      var fragEv = eventList();
+      chrome.webNavigation.onHistoryStateUpdated = histEv;
+      chrome.webNavigation.onReferenceFragmentUpdated = fragEv;
+      var __lastTabUrl = Object.create(null);
+      var __stripHash = function (u) { var i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); };
+      // Both sources can describe the same navigation; emitting twice would double every
+      // listener's work (Cloaked would install its bridge twice).
+      var __recentNav = Object.create(null);
+      var __emitNav = function (tabId, prev, next, frameId) {
+        if (!next || prev === next) return;
+        var key = tabId + "|" + next;
+        var now = Date.now();
+        if (__recentNav[key] && now - __recentNav[key] < 1500) return;
+        __recentNav[key] = now;
+        // Only the fragment moved → reference-fragment; anything else → history state.
+        var ev = prev && __stripHash(prev) === __stripHash(next) ? fragEv : histEv;
+        ev._emit({
+          tabId: tabId, url: next, frameId: frameId || 0, parentFrameId: -1, processId: -1,
+          timeStamp: now, transitionType: "link", transitionQualifiers: [],
+          documentId: String(tabId),
+        });
+      };
+
+      // Receiving half only: a content script gets the same inert stubs backfilled, but it
+      // is the SENDER here. Registering the relay there would add a stray onMessage
+      // listener to every page in the browser for no benefit.
+      // A worker has no window; an extension document has the extension scheme. A content
+      // script is the only context with a window on an http(s) origin.
+      var __isExtensionCtx = (typeof window === "undefined")
+        || (typeof location !== "undefined"
+            && /^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol));
+
+      try {
+        if (__isExtensionCtx && chrome.runtime && chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+          chrome.runtime.onMessage.addListener(function (msg, sender) {
+            if (!msg || !msg.__c2sNav || !sender) return;
+            var tabId = sender.tab && sender.tab.id != null ? sender.tab.id : -1;
+            var next = msg.__c2sNav.url;
+            if (!next) return;
+            // The sender is stateless by necessity, so the previous URL is ours to keep.
+            // No record yet means the tab's first report: a full load, which is
+            // onCommitted's event, not one of ours.
+            var prev = __lastTabUrl[tabId];
+            __lastTabUrl[tabId] = next;
+            if (prev) __emitNav(tabId, prev, next, sender.frameId);
+          });
+        }
+      } catch (e) {}
+
+      try {
+        if (__isExtensionCtx && chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
+          chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
+            // A real load reports status:"loading" first; that is onCommitted's job.
+            if (!changeInfo || !changeInfo.url || changeInfo.status === "loading") return;
+            var prev = __lastTabUrl[tabId];
+            __lastTabUrl[tabId] = changeInfo.url;
+            if (prev) __emitNav(tabId, prev, changeInfo.url, 0);
+          });
+          if (chrome.tabs.onRemoved && typeof chrome.tabs.onRemoved.addListener === "function") {
+            chrome.tabs.onRemoved.addListener(function (tabId) { delete __lastTabUrl[tabId]; });
+          }
+        }
+      } catch (e) {}
+    }
+
     // chrome.windows — Safari ships most of it on macOS but OMITS some events
     // (notably onBoundsChanged) and is absent entirely on iOS. A bundle reading
     // chrome.windows.onBoundsChanged.addListener at module-eval throws and aborts
@@ -6165,6 +6247,81 @@ var __C2S_DEBUG__ = false;
           }
         });
       }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Content-script half of the webNavigation.onHistoryStateUpdated emulation above.
+  // Safari delivers no navigation events to the background page, so the page itself
+  // reports its own same-document navigations and the background re-emits them in the
+  // Chrome event shape. Runs only in a content script: an extension page navigating
+  // itself is not a browsing navigation and must not be reported as one.
+  if (typeof window !== "undefined" && typeof location !== "undefined"
+      && !/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) {
+    try {
+      // This half holds NO cross-navigation state. Safari re-injects content scripts on
+      // same-document navigations (measured on GitHub: every Turbo click re-ran this
+      // file) AND gives each injection a fresh isolated world, so neither a closure nor a
+      // property on `window` survives to be compared against — both get re-seeded to the
+      // very URL being detected. So just announce the current URL on every injection and
+      // let the background, which does persist, decide whether it changed.
+      var __lastSent = null;
+      var __navReport = function () {
+        var next = location.href;
+        if (next === __lastSent) return;
+        __lastSent = next;
+        try { chrome.runtime.sendMessage({ __c2sNav: { url: next } }); } catch (e) {}
+      };
+      __navReport();
+      // A content script runs in an ISOLATED WORLD, so patching history.pushState here
+      // never observes the page's own calls — the page holds a different `history`.
+      // Live: GitHub's Turbo router pushes state in the page world and the wrapper below
+      // saw nothing. location.href does reflect the result in both worlds, so watch that
+      // instead. No world:MAIN injection, which would raise the Safari floor to 18.4.
+      //
+      // Watched in short bursts after input rather than on a standing interval: SPA
+      // routing is user-driven, and a permanent timer in every frame of every page is a
+      // real cost for a rare event. Ceiling: a purely programmatic navigation with no
+      // preceding input (a timer-driven redirect) is missed until the next one.
+      var __burstTimer = null;
+      var __burstUntil = 0;
+      var __watch = function () {
+        __burstUntil = Date.now() + 2500;
+        if (__burstTimer) return;
+        try {
+          __burstTimer = setInterval(function () {
+            __navReport();
+            if (Date.now() > __burstUntil) {
+              try { clearInterval(__burstTimer); } catch (e) {}
+              __burstTimer = null;
+            }
+          }, 150);
+        } catch (e) {}
+      };
+      window.addEventListener("popstate", function () { __navReport(); __watch(); });
+      window.addEventListener("hashchange", function () { __navReport(); __watch(); });
+      window.addEventListener("pagehide", function () {
+        try { if (__burstTimer) clearInterval(__burstTimer); } catch (e) {}
+        __burstTimer = null;
+      });
+      try {
+        // Capture phase: the page's own handler usually calls preventDefault and routes.
+        document.addEventListener("click", __watch, true);
+        document.addEventListener("keydown", function (e) {
+          if (e && (e.key === "Enter" || e.key === " ")) __watch();
+        }, true);
+      } catch (e) {}
+      // Covers a navigation the content script itself performs.
+      var __wrapHistory = function (name) {
+        var orig = history[name];
+        if (typeof orig !== "function") return;
+        history[name] = function () {
+          var r = orig.apply(this, arguments);
+          try { setTimeout(__navReport, 0); } catch (e) {}
+          return r;
+        };
+      };
+      __wrapHistory("pushState");
+      __wrapHistory("replaceState");
     } catch (e) { /* ignore */ }
   }
 
