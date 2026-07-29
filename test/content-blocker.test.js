@@ -79,3 +79,20 @@ test("fires when broad host comes from content_scripts matches (MV3, no host_per
   );
   assert.ok(cb(issues), "content-blocker issue expected from content_scripts matches");
 });
+
+test("does NOT fire on a userscript manager that drives DNR dynamically", () => {
+  const issues = scan({
+    manifest_version: 3,
+    name: "Tampermonkey",
+    version: "5.5.0",
+    permissions: [
+      "webRequest",
+      "webRequestBlocking",
+      "declarativeNetRequestWithHostAccess",
+      "scripting",
+      "userScripts",
+    ],
+    host_permissions: ["<all_urls>"],
+  });
+  assert.equal(cb(issues), undefined);
+});

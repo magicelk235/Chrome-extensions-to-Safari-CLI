@@ -1,6 +1,7 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { basename, join, dirname, resolve, relative, sep } from "node:path";
 import { cleanExtendedAttributes } from "./extract.js";
+import type { Manifest } from "../types.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -125,6 +126,58 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
+
+// Safari drops the LAST entry of _locales/<locale>/messages.json. Live on
+// Tampermonkey: `v0version0` ("v$version$") is the final message and getMessage
+// returned "" for it in every form — no substitution, string substitution, array
+// substitution — while `top_level_await`, the entry immediately before it, resolved
+// fine. Nothing about the entry is special (its neighbours past the same byte offset
+// work, and other placeholder messages work); it is dropped for being last. The
+// extension then falls back to displaying the raw message key, which is how the
+// Tampermonkey dashboard came to render a literal "v0version0" as its version.
+//
+// Append a sacrificial message so the extension's own last string is no longer last.
+// The insert is textual, before the closing brace, so every existing byte (formatting,
+// escapes, unicode) survives exactly as shipped. Returns files modified.
+const LOCALE_TAIL_GUARD = "viaduct_locale_tail_guard";
+
+export function guardLocaleTailMessage(stageDir: string): number {
+  const localesDir = join(stageDir, "_locales");
+  if (!existsSync(localesDir)) return 0;
+  let modified = 0;
+  for (const entry of readdirSync(localesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const file = join(localesDir, entry.name, "messages.json");
+    if (!existsSync(file)) continue;
+    let raw: string;
+    try {
+      raw = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    // Only touch a catalog we can confirm is a non-empty JSON object — a broken or
+    // empty one has no last message to lose, and rewriting it could only make things
+    // worse.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const keys = Object.keys(parsed as Record<string, unknown>);
+    if (keys.length === 0 || keys[keys.length - 1] === LOCALE_TAIL_GUARD) continue;
+    const close = raw.lastIndexOf("}");
+    if (close < 0) continue;
+    const next =
+      raw.slice(0, close) +
+      `,"${LOCALE_TAIL_GUARD}":{"message":"viaduct"}` +
+      raw.slice(close);
+    writeFileSync(file, next, "utf-8");
+    modified++;
+  }
+  return modified;
+}
 
 export function walkScripts(dir: string, acc: string[] = []): string[] {
   let entries;
@@ -466,6 +519,78 @@ export function rewriteSelfPageExtensionUrls(stageDir: string): number {
       return "chrome.runtime.getURL(`" + path + "`)";
     });
     if (changed) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
+// MV3 bundles decide "am I the background?" by the absence of `window`, because in Chrome
+// the background is a service worker. Safari has no offscreen documents and an unreliable
+// SW background, so the conversion turns the worker into a background PAGE — which HAS a
+// window, so the check says no and the bundle concludes it is a content script. Anything
+// keyed off that identity then misroutes silently: no error, no log, just a promise that
+// never settles. Live: Cloaked's crx-kit dispatcher opens with
+// `if (msg.to !== this.myEndpoint) return false`, and its background page reported
+// FOREGROUND — so clicking "Log in" delivered {to:"BACKGROUND", name:"openAuthUrl"} to a
+// listener that dropped it on the floor, and the popup spun forever.
+//
+// Only rewritten inside the files the background itself loads, and only where the check
+// directly produces a background-ish value — so a bundled library using the same idiom to
+// pick a Node path, or the identical detector inside the POPUP bundle (which must keep
+// answering "foreground"), is never touched.
+const WINDOW_IS_UNDEFINED = [
+  String.raw`void\s+0\s*===?\s*(?:globalThis\.|self\.)?window`,
+  String.raw`(?:globalThis\.|self\.)?window\s*===?\s*void\s+0`,
+  String.raw`typeof\s+(?:globalThis\.|self\.)?window\s*===?\s*(?:"undefined"|'undefined')`,
+  String.raw`(?:"undefined"|'undefined')\s*===?\s*typeof\s+(?:globalThis\.|self\.)?window`,
+  // terser shorthand: a type string sorts after "u" only when it is "undefined"
+  String.raw`typeof\s+(?:globalThis\.|self\.)?window\s*>\s*(?:"u"|'u')`,
+].join("|");
+
+const BACKGROUND_LITERAL =
+  String.raw`(?:"|')(?:background|background_script|backgroundScript|background-script|service_worker|serviceWorker|sw)(?:"|')`;
+
+/** `if (typeof window === "undefined") return "background_script"` */
+const BG_CHECK_RETURN_RE = new RegExp(
+  // `return` may butt straight against the quote — minifiers emit `return"background"`.
+  String.raw`(\bif\s*\(\s*)(?:${WINDOW_IS_UNDEFINED})(\s*\)\s*\{?\s*return\s*${BACKGROUND_LITERAL})`,
+  "g",
+);
+
+/** `typeof window === "undefined" ? "background" : …` */
+const BG_CHECK_TERNARY_RE = new RegExp(
+  String.raw`(?:${WINDOW_IS_UNDEFINED})(\s*\?\s*${BACKGROUND_LITERAL})`,
+  "g",
+);
+
+/** Absolute paths of the staged scripts the background context loads. */
+function backgroundScriptPaths(stageDir: string, manifest: Manifest): string[] {
+  const rel: string[] = [];
+  const sw = manifest.background?.service_worker;
+  if (typeof sw === "string") rel.push(sw);
+  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") rel.push(s);
+  return rel
+    .map((r) => join(stageDir, r.replace(/^\.?\//, "")))
+    .filter((p) => existsSync(p));
+}
+
+export function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): number {
+  let modified = 0;
+  for (const file of backgroundScriptPaths(stageDir, manifest)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    // The file IS the background, page or worker, so the check's answer is
+    // unconditionally yes.
+    const next = content
+      .replace(BG_CHECK_RETURN_RE, "$1true$2")
+      .replace(BG_CHECK_TERNARY_RE, "true$1");
+    if (next !== content) {
       writeFileSync(file, next, "utf-8");
       modified++;
     }

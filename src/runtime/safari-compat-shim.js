@@ -144,24 +144,6 @@ var __C2S_DEBUG__ = false;
   if (!api) return;
   // ────────────────────────────────────────────────────────────────────────────
 
-  // [DIAG] Universal tracer: record EVERY runtime message + port connect this context
-  // receives, into storage.local. Lets us confirm whether this (background) context is
-  // the one that actually receives the popover's traffic. Remove after debugging.
-  try {
-    if (typeof chrome !== "undefined" && chrome.runtime) {
-      if (chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
-        chrome.runtime.onMessage.addListener(function (m) {
-          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagMsgs", function (o) { var k = "__c2sDiagMsgs"; var a = (o && o[k]) || []; a.push({ t: Date.now(), keys: Object.keys(m || {}).slice(0, 6) }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
-        });
-      }
-      if (chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
-        chrome.runtime.onConnect.addListener(function (p) {
-          try { if (chrome.storage && chrome.storage.local) chrome.storage.local.get("__c2sDiagConn", function (o) { var k = "__c2sDiagConn"; var a = (o && o[k]) || []; a.push({ t: Date.now(), name: (p && p.name) || "" }); while (a.length > 30) a.shift(); var s = {}; s[k] = a; chrome.storage.local.set(s); }); } catch (e) {}
-        });
-      }
-    }
-  } catch (e) {}
-
   // navigator.userAgent Chrome-version spoof. Websites (and extension code reacting
   // to the page) commonly sniff the Chrome version out of the UA
   // (e.g. /Chrom(e|ium)\/(\d+)\.(\d+)\.(\d+)\.(\d+)/) to gate behaviour or build
@@ -230,7 +212,14 @@ var __C2S_DEBUG__ = false;
 
   // Inert event stub so module-eval code that reads .addListener on a missing API does not throw.
   function event() {
-    return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
+    // __c2sInert marks a backfilled event that can never fire. Backfilling keeps a
+    // module-eval read from throwing, but anything that depends on delivery has to be
+    // able to tell this apart from the platform's own event (see the user-script
+    // injection wiring, which silently listened to one of these for three builds).
+    return {
+      addListener: function () {}, removeListener: function () {},
+      hasListener: function () { return false; }, __c2sInert: true,
+    };
   }
   // A live event with real listener storage + _emit, for emulated APIs that fire.
   function eventList() {
@@ -2533,7 +2522,28 @@ var __C2S_DEBUG__ = false;
               id: "c2s-offscreen", type: "window", url: __offscreenAbsUrl,
               frameType: "nested", focused: false, visibilityState: "hidden",
               focus: function () { return Promise.resolve(this); },
-              postMessage: function () {},
+              // A real client.postMessage arrives as a "message" event on the client
+              // document's navigator.serviceWorker, carrying any transferred ports.
+              // Dropping it strands every caller that awaits a reply on a transferred
+              // MessagePort — Chrome's documented SW->offscreen binary handshake
+              // (client.postMessage(msg, [port2]) then await port1.onmessage). Nothing
+              // throws, so it reads as a silent hang: live, Tampermonkey's editor save
+              // wraps the script source in an object URL created offscreen, and saving
+              // any userscript spun forever on "Please wait...".
+              postMessage: function (data, transfer) {
+                var w = __offscreenFrame && __offscreenFrame.contentWindow;
+                if (!w) return;
+                var ports = transfer || [];
+                try {
+                  var sw = w.navigator && w.navigator.serviceWorker;
+                  if (sw && typeof sw.dispatchEvent === "function" && w.MessageEvent) {
+                    sw.dispatchEvent(new w.MessageEvent("message", { data: data, ports: ports }));
+                    return;
+                  }
+                } catch (e) {}
+                // Fall back to a window message for offscreen docs that listen there.
+                try { w.postMessage(data, "*", ports); } catch (e) {}
+              },
             });
             return Promise.resolve(out);
           },
@@ -3071,8 +3081,6 @@ var __C2S_DEBUG__ = false;
     var __vManifest = {}; try { __vManifest = chrome.runtime.getManifest() || {}; } catch (e) {}
     var __vAct = __vManifest.action || __vManifest.browser_action || {};
     var __vPopupWired = !!(__vAct && __vAct.default_popup === "__viaduct-action.html");
-    var __vHotkeyWired = false;
-    try { var __vcs = __vManifest.content_scripts || []; for (var __ci = 0; __ci < __vcs.length; __ci++) { if ((__vcs[__ci].js || []).indexOf("__viaduct-hotkey.js") >= 0) { __vHotkeyWired = true; break; } } } catch (e) {}
     if (__vPopupWired) try {
       var __vClickStore = (self.__viaductOnClicked = self.__viaductOnClicked || []);
       var __vBridge = false;
@@ -3166,8 +3174,15 @@ var __C2S_DEBUG__ = false;
     // generated __viaduct-hotkey.js (present only when viaduct could determine the action
     // message) does that. The shim runs before the bundle's content script, so its
     // listeners are captured here.
+    //
+    // Do NOT gate this on the manifest's content_scripts: Safari strips content_scripts
+    // from getManifest() inside a content script, so any "is a hotkey wired" check derived
+    // from it reads false there and the capture never installed — the hotkey then replayed
+    // to an empty list and the toggle (SuperDev's Cmd+Shift+S sidebar) did nothing.
+    // Capturing always in a content-script context costs only a few listener refs; when no
+    // hotkey script exists the array is simply never read.
     try {
-      if (__vHotkeyWired && typeof window !== "undefined" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
+      if (typeof window !== "undefined" && !(chrome.tabs && typeof chrome.tabs.query === "function")) {
         var __vMsg = (self.__viaductMsgListeners = self.__viaductMsgListeners || []);
         var __vWrapOnMessage = function (rt) {
           if (!rt || !rt.onMessage || typeof rt.onMessage.addListener !== "function" || rt.onMessage.__viaductWrapped) return;
@@ -4009,6 +4024,88 @@ var __C2S_DEBUG__ = false;
       onReferenceFragmentUpdated: event(), onTabReplaced: event(), onHistoryStateUpdated: event(),
     });
 
+    // Safari never fires onHistoryStateUpdated / onReferenceFragmentUpdated, and an inert
+    // backfill is indistinguishable from a real event that just hasn't fired yet — so a
+    // bundle that keys real work off SPA navigation stalls with nothing logged. Live:
+    // Cloaked installs its page↔extension bridge from onHistoryStateUpdated on
+    // my.cloaked.com (a Vue app), so after login the dashboard's postMessage had no
+    // listener and the extension never received the session.
+    //
+    // The signal is taken from the CONTENT SCRIPT, not from tabs.onUpdated. Measured on
+    // Safari 26: a converted background page receives no tabs.onUpdated and no
+    // webNavigation.onCommitted at all, on either the chrome or the browser namespace,
+    // for a full load or an in-page click, with <all_urls> granted. Nothing background-
+    // side is a foundation to build on. The content script sits where the navigation
+    // actually happens, so it hooks pushState/replaceState/popstate/hashchange and
+    // relays up; the background turns each relay back into the Chrome event shape.
+    // tabs.onUpdated stays wired as a second source for hosts that do deliver it.
+    if (chrome.webNavigation.onHistoryStateUpdated && chrome.webNavigation.onHistoryStateUpdated.__c2sInert) {
+      var histEv = eventList();
+      var fragEv = eventList();
+      chrome.webNavigation.onHistoryStateUpdated = histEv;
+      chrome.webNavigation.onReferenceFragmentUpdated = fragEv;
+      var __lastTabUrl = Object.create(null);
+      var __stripHash = function (u) { var i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); };
+      // Both sources can describe the same navigation; emitting twice would double every
+      // listener's work (Cloaked would install its bridge twice).
+      var __recentNav = Object.create(null);
+      var __emitNav = function (tabId, prev, next, frameId) {
+        if (!next || prev === next) return;
+        var key = tabId + "|" + next;
+        var now = Date.now();
+        if (__recentNav[key] && now - __recentNav[key] < 1500) return;
+        __recentNav[key] = now;
+        // Only the fragment moved → reference-fragment; anything else → history state.
+        var ev = prev && __stripHash(prev) === __stripHash(next) ? fragEv : histEv;
+        ev._emit({
+          tabId: tabId, url: next, frameId: frameId || 0, parentFrameId: -1, processId: -1,
+          timeStamp: now, transitionType: "link", transitionQualifiers: [],
+          documentId: String(tabId),
+        });
+      };
+
+      // Receiving half only: a content script gets the same inert stubs backfilled, but it
+      // is the SENDER here. Registering the relay there would add a stray onMessage
+      // listener to every page in the browser for no benefit.
+      // A worker has no window; an extension document has the extension scheme. A content
+      // script is the only context with a window on an http(s) origin.
+      var __isExtensionCtx = (typeof window === "undefined")
+        || (typeof location !== "undefined"
+            && /^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol));
+
+      try {
+        if (__isExtensionCtx && chrome.runtime && chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+          chrome.runtime.onMessage.addListener(function (msg, sender) {
+            if (!msg || !msg.__c2sNav || !sender) return;
+            var tabId = sender.tab && sender.tab.id != null ? sender.tab.id : -1;
+            var next = msg.__c2sNav.url;
+            if (!next) return;
+            // The sender is stateless by necessity, so the previous URL is ours to keep.
+            // No record yet means the tab's first report: a full load, which is
+            // onCommitted's event, not one of ours.
+            var prev = __lastTabUrl[tabId];
+            __lastTabUrl[tabId] = next;
+            if (prev) __emitNav(tabId, prev, next, sender.frameId);
+          });
+        }
+      } catch (e) {}
+
+      try {
+        if (__isExtensionCtx && chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === "function") {
+          chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
+            // A real load reports status:"loading" first; that is onCommitted's job.
+            if (!changeInfo || !changeInfo.url || changeInfo.status === "loading") return;
+            var prev = __lastTabUrl[tabId];
+            __lastTabUrl[tabId] = changeInfo.url;
+            if (prev) __emitNav(tabId, prev, changeInfo.url, 0);
+          });
+          if (chrome.tabs.onRemoved && typeof chrome.tabs.onRemoved.addListener === "function") {
+            chrome.tabs.onRemoved.addListener(function (tabId) { delete __lastTabUrl[tabId]; });
+          }
+        }
+      } catch (e) {}
+    }
+
     // chrome.windows — Safari ships most of it on macOS but OMITS some events
     // (notably onBoundsChanged) and is absent entirely on iOS. A bundle reading
     // chrome.windows.onBoundsChanged.addListener at module-eval throws and aborts
@@ -4035,12 +4132,70 @@ var __C2S_DEBUG__ = false;
       create: function (opts, cb) {
         var url = opts && opts.url;
         try { if (url && chrome.tabs && chrome.tabs.create) chrome.tabs.create({ url: Array.isArray(url) ? url[0] : url }); } catch (e) {}
-        return dual({ id: -1, tabs: [] }, cb);
+        return dual({ id: -1, tabs: [{ id: -1, index: 0, windowId: -1, active: true, url: Array.isArray(url) ? url[0] : (url || "") }] }, cb);
       },
       update: function (id, info, cb) { return dual({ id: id }, cb); },
       remove: function (id, cb) { return dual(undefined, cb); },
       onCreated: event(), onRemoved: event(), onFocusChanged: event(), onBoundsChanged: event(),
     });
+
+    // Chrome's windows.create resolves a Window whose `tabs` array is populated;
+    // Safari's native create resolves the Window with `tabs` undefined. Auth flows
+    // that open a login window read the new tab straight off the result and treat a
+    // missing one as a hard failure — live: Cloaked's "Log in" throws "Created window
+    // has no tabs available", the popup has already called window.close(), and the
+    // user is left with a spinner that vanishes and no login. Backfill `tabs` from a
+    // tabs.query on the new window id. fill() above can't cover this: the method
+    // EXISTS on macOS, it just under-reports.
+    (function () {
+      var orig = chrome.windows && chrome.windows.create;
+      if (typeof orig !== "function" || chrome.windows.__c2sCreateWrapped) return;
+      chrome.windows.__c2sCreateWrapped = true;
+      chrome.windows.create = function (opts, cb) {
+        var self = this;
+        var call = function (o) {
+          try {
+            var r = orig.call(self, o);
+            return (r && typeof r.then === "function") ? r : Promise.resolve(r);
+          } catch (e) { return Promise.reject(e); }
+        };
+        var p = call(opts).catch(function (err) {
+          // Safari rejects window types it doesn't render ("popup"/"panel"). A login
+          // window in a normal window beats no login window, so drop the type and retry.
+          if (opts && opts.type && opts.type !== "normal") {
+            var o2 = {}; for (var k in opts) { if (k !== "type") o2[k] = opts[k]; }
+            return call(o2);
+          }
+          throw err;
+        });
+        p = p.then(function (w) {
+          if (!w || (w.tabs && w.tabs.length)) return w;
+          var url = opts && opts.url;
+          var stub = [{ id: -1, index: 0, windowId: (w && typeof w.id === "number") ? w.id : -1,
+                        active: true, url: Array.isArray(url) ? url[0] : (url || "") }];
+          if (!(chrome.tabs && chrome.tabs.query) || typeof w.id !== "number") {
+            try { w.tabs = stub; } catch (e) {}
+            return w;
+          }
+          return new Promise(function (res) {
+            var settled = false;
+            var settle = function (tabs) {
+              if (settled) return;
+              settled = true;
+              // Never hand back a Window with no tabs: callers index tabs[0] directly.
+              try { w.tabs = (tabs && tabs.length) ? tabs : stub; } catch (e) {}
+              res(w);
+            };
+            try {
+              var q = chrome.tabs.query({ windowId: w.id }, settle);
+              if (q && typeof q.then === "function") q.then(settle, function () { settle(null); });
+            } catch (e) { settle(null); }
+          });
+        });
+        if (typeof cb === "function") { p.then(function (v) { try { cb(v); } catch (e) {} }, function () {}); return; }
+        return p;
+      };
+    })();
 
     // chrome.devtools — DevTools-page extensions (devtools_page in the manifest)
     // have NO Safari equivalent; the panels/network/inspectedWindow surface is
@@ -4447,12 +4602,13 @@ var __C2S_DEBUG__ = false;
       updateVoices: function () {},
       onSpeak: event(), onStop: event(), onPause: event(), onResume: event(),
     });
-    // chrome.userScripts — Safari has no persistent user-script registry, so keep a
-    // coherent in-memory one: register/getScripts/update/unregister round-trip
-    // correctly (the common "register then query/manage" pattern). This
-    // does NOT actually inject the scripts (WebKit gives no API for dynamic user
-    // worlds); it makes the management surface consistent so callers don't reject.
-    // Upgrade path: map to scripting.registerContentScripts if/when Safari exposes it.
+    // chrome.userScripts — Safari has no dynamic user-script registry, so the shim
+    // keeps the in-memory one AND runs it: register/getScripts/update/unregister
+    // round-trip, and each registered script is injected on navigation through
+    // scripting.executeScript, which Safari does support. Bookkeeping alone is not
+    // enough for the extensions that matter here — Tampermonkey ships NO
+    // content_scripts and registers every userscript through this API, so a registry
+    // that never injects means scripts save, list as enabled, and never run.
     chrome.userScripts = chrome.userScripts || {};
     (function () {
       var scripts = {}; // id -> RegisteredUserScript
@@ -4464,6 +4620,7 @@ var __C2S_DEBUG__ = false;
             if (scripts[s.id]) return rejectOrCb(new Error("Duplicate script id: " + s.id), cb);
           }
           for (var j = 0; j < arr.length; j++) scripts[arr[j].id] = shallowCopy(arr[j]);
+          publish();
           return dual(undefined, cb);
         },
         unregister: function (filter, cb) {
@@ -4471,12 +4628,14 @@ var __C2S_DEBUG__ = false;
           var ids = filter && filter.ids;
           if (ids && ids.length) { for (var i = 0; i < ids.length; i++) delete scripts[ids[i]]; }
           else scripts = {};
+          publish();
           return dual(undefined, cb);
         },
         update: function (list, cb) {
           var arr = Array.isArray(list) ? list : [];
           for (var i = 0; i < arr.length; i++) { var s = arr[i]; if (!s || !scripts[s.id]) return rejectOrCb(new Error("No script with id: " + (s && s.id)), cb); }
           for (var j = 0; j < arr.length; j++) { var u = arr[j]; var cur = scripts[u.id]; for (var k in u) cur[k] = u[k]; }
+          publish();
           return dual(undefined, cb);
         },
         getScripts: function (filter, cb) {
@@ -4491,6 +4650,63 @@ var __C2S_DEBUG__ = false;
       });
       function shallowCopy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
       function rejectOrCb(err, cb) { if (typeof cb === "function") { setLastErr({ message: err.message }); try { cb(); } finally { setLastErr(null); } return undefined; } return Promise.reject(err); }
+
+      // ── publishing the registry ─────────────────────────────────────────────
+      // The page side reads this out of storage rather than asking for it over
+      // runtime.sendMessage. That broadcast reaches every listener, the first
+      // sendResponse wins, and the extension's own background handler consumed the
+      // request and answered with nothing — twelve retries over three seconds never
+      // once got our reply through. Storage has neither a race nor a boot problem: it
+      // survives the background being torn down, so a content script that runs before
+      // the background has finished waking still finds the scripts.
+      var STORE_KEY = "__viaductUserScripts";
+      function publish() {
+        var out = [];
+        for (var id in scripts) {
+          var rec = scripts[id];
+          if (!rec) continue;
+          var js = Array.isArray(rec.js) ? rec.js : [];
+          var code = "", files = [];
+          for (var i = 0; i < js.length; i++) {
+            if (!js[i]) continue;
+            if (js[i].code) code += (code ? "\n;" : "") + js[i].code;
+            else if (js[i].file) files.push(js[i].file);
+          }
+          out.push({
+            id: id, code: code, files: files, runAt: rec.runAt, allFrames: !!rec.allFrames,
+            matches: rec.matches || [], excludeMatches: rec.excludeMatches || [],
+            includeGlobs: rec.includeGlobs || [], excludeGlobs: rec.excludeGlobs || [],
+          });
+        }
+        // File-backed entries are read here, not in the page: they need not be
+        // web-accessible resources, so the page could not fetch them itself.
+        var pending = [];
+        for (var n = 0; n < out.length; n++) {
+          (function (entry) {
+            for (var f = 0; f < entry.files.length; f++) {
+              (function (file) {
+                try {
+                  pending.push(fetch(chrome.runtime.getURL(file))
+                    .then(function (r) { return r.text(); })
+                    .then(function (t) { entry.code += (entry.code ? "\n;" : "") + t; })
+                    .catch(function () {}));
+                } catch (e) {}
+              })(entry.files[f]);
+            }
+          })(out[n]);
+        }
+        var write = function () {
+          try {
+            var o = {}; o[STORE_KEY] = out;
+            chrome.storage.local.set(o, function () {
+              try { if (chrome.runtime.lastError) usLog("could not publish: " + chrome.runtime.lastError.message); } catch (e) {}
+            });
+            usLog("published " + out.length + " script(s) for the page injector");
+          } catch (e) { usLog("could not publish: " + ((e && e.message) || e)); }
+        };
+        if (pending.length) Promise.all(pending).then(write, write); else write();
+      }
+      function usLog(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
     })();
 
     // chrome.scripting DYNAMIC content-script registration (registerContentScripts /
@@ -4800,9 +5016,64 @@ var __C2S_DEBUG__ = false;
     var wrapDnrUpdate = function (name) {
       var orig = dnrNs[name];
       if (typeof orig !== "function" || orig.__c2sWrapped) return;
+      // One call, resolving true when Safari accepted it. Passes both a callback and
+      // reads the returned promise so it works whichever style the platform hands us.
+      var tryOne = function (arg) {
+        return new Promise(function (res) {
+          var done = false;
+          var fin = function (ok) { if (!done) { done = true; res(ok); } };
+          try {
+            var p = orig.call(dnrNs, arg, function () {
+              var e = null;
+              try { e = chrome.runtime && chrome.runtime.lastError; } catch (e2) {}
+              fin(!e);
+            });
+            if (p && typeof p.then === "function") p.then(function () { fin(true); }, function () { fin(false); });
+          } catch (e) { fin(false); }
+        });
+      };
+      // Safari rejects the WHOLE update when any single rule is invalid, most often an
+      // unsupported regexFilter (WebKit's regex engine takes a narrower subset than
+      // Chrome's). All-or-nothing means one bad rule silently costs the extension every
+      // other rule in the batch: Tampermonkey registers all its *.user.js interception
+      // rules in one call, so a single unsupported pattern killed userscript-URL
+      // detection outright. Re-apply the removals, then add rules one at a time and
+      // keep whatever Safari accepts.
+      var salvage = function (opts) {
+        var kept = 0;
+        var chain = Promise.resolve();
+        if (opts && opts.removeRuleIds && opts.removeRuleIds.length) {
+          chain = chain.then(function () { return tryOne({ removeRuleIds: opts.removeRuleIds }); });
+        }
+        var add = (opts && opts.addRules) || [];
+        add.forEach(function (r) {
+          chain = chain.then(function () {
+            return tryOne({ addRules: [r] }).then(function (ok) { if (ok) kept++; });
+          });
+        });
+        return chain.then(function () { return kept; });
+      };
       var wrapped = function (opts, cb) {
         try { opts = stripModifyHeaders(opts); } catch (e) {}
-        return orig.call(dnrNs, opts, cb);
+        var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
+        if (typeof cb === "function") {
+          return orig.call(dnrNs, opts, function () {
+            var err = null;
+            try { err = chrome.runtime && chrome.runtime.lastError; } catch (e) {}
+            if (!err) { try { cb(); } catch (e) {} return; }
+            salvage(opts).then(function (kept) {
+              // Nothing landed at all: the original failure is the honest answer.
+              if (!kept && addCount) setLastErr({ message: String((err && err.message) || err) });
+              try { cb(); } finally { setLastErr(null); }
+            });
+          });
+        }
+        var p;
+        try { p = orig.call(dnrNs, opts); } catch (e) { p = Promise.reject(e); }
+        if (!p || typeof p.then !== "function") return p;
+        return p.catch(function (e) {
+          return salvage(opts).then(function (kept) { if (!kept && addCount) throw e; });
+        });
       };
       // Bare assignment can silently no-op (or throw) on Safari's exotic DNR slot;
       // only mark it wrapped once the install is verified to have taken.
@@ -5135,6 +5406,18 @@ var __C2S_DEBUG__ = false;
   // wired for messages Safari does deliver (e.g. content-script → bg).
   (function () {
     try {
+      // CONTENT SCRIPTS must keep their NATIVE chrome/browser. This block ends by
+      // republishing chrome/browser as a wrap() Proxy (for the storage relay + facade),
+      // and Safari's native content↔background runtime messaging only works on the real,
+      // unwrapped object — wrapping it silently drops delivery (TWP's content script sends
+      // translateHTML and the reply never arrives once chrome is a Proxy, so translation
+      // stalls). The relay is only needed on EXTENSION pages (popover/panel/options/bg),
+      // which run on the extension protocol; content scripts run on http(s). Bail here so a
+      // content script never gets the relay or the Proxy — it uses Safari's native transport,
+      // which delivers content→bg fine.
+      var __ctxProto = "";
+      try { __ctxProto = (typeof location !== "undefined" && location.protocol) || ""; } catch (e) {}
+      if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(__ctxProto)) return;
       var nativeChrome = (typeof chrome !== "undefined") ? chrome : null;
       var nativeBrowser = (typeof browser !== "undefined") ? browser : null;
       var probe = nativeChrome || nativeBrowser;
@@ -5371,8 +5654,56 @@ var __C2S_DEBUG__ = false;
       // sweep orphaned mailbox records on init (and shortly after) so a store bloated by
       // past sessions doesn't stall this open's request delivery.
       try { sweepStale(); setTimeout(sweepStale, 2000); setTimeout(scanPending, 400); setTimeout(scanPending, 1500); setTimeout(scanPending, 4000); } catch (e) {}
-      if (nativeChrome) __publishGlobal("chrome", wrap(nativeChrome));
-      if (nativeBrowser) __publishGlobal("browser", wrap(nativeBrowser));
+      // Replacing an EXTENSION PAGE's global api object with a Proxy makes Safari stop
+      // delivering content-script messages to that page entirely — bisected live: a
+      // background page that only differed by this swap received nothing, and a listener
+      // registered on the pristine native event BEFORE the swap stopped receiving too.
+      // So Safari resolves deliverability against the page's current global at dispatch
+      // time, and swapping it detaches the page. That silently broke every converted
+      // extension whose content scripts message the background (Cloaked's login tokens
+      // travel exactly that path).
+      //
+      // The two members the relay needs can be patched in place instead — installOverride
+      // falls back to defineProperty, which Safari permits on these slots — and that
+      // leaves the global identity, and therefore native delivery, alone. Content scripts
+      // keep the old swap: it is harmless there (verified: sending still works) and it
+      // carries the runtime.id spoof, which an in-place patch cannot (frozen slot).
+      // The EVENT OBJECT's identity is what has to survive: replacing runtime.onMessage
+      // with a facade breaks delivery exactly as swapping the global did (both bisected
+      // live). Wrapping addListener in place keeps the object Safari dispatches through
+      // while still recording each listener for the storage relay.
+      var captureListeners = function (base) {
+        var ev = base.runtime && base.runtime.onMessage;
+        if (!ev || typeof ev.addListener !== "function") return false;
+        var nAdd = ev.addListener.bind(ev);
+        var nRemove = typeof ev.removeListener === "function" ? ev.removeListener.bind(ev) : null;
+        var ok = installOverride(ev, "addListener", function (fn) {
+          if (typeof fn !== "function") return;
+          if (listeners.indexOf(fn) < 0) listeners.push(fn);
+          try { nAdd(fn); } catch (e) {}
+          // A relayed request may already be sitting in storage from before this
+          // listener existed.
+          scanPending();
+        });
+        if (ok && nRemove) {
+          installOverride(ev, "removeListener", function (fn) {
+            var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1);
+            try { nRemove(fn); } catch (e) {}
+          });
+        }
+        return ok;
+      };
+      var applyRelay = function (base, name) {
+        if (!base || !base.runtime) return;
+        if (!__relayExtPage) { __publishGlobal(name, wrap(base)); return; }
+        var okOn = captureListeners(base);
+        var okSend = installOverride(base.runtime, "sendMessage", bridgeSend);
+        // A page with no relay is worse than one with degraded native delivery, so fall
+        // back to the swap wherever the platform refuses the in-place patch.
+        if (!okOn || !okSend) __publishGlobal(name, wrap(base));
+      };
+      if (nativeChrome) applyRelay(nativeChrome, "chrome");
+      if (nativeBrowser) applyRelay(nativeBrowser, "browser");
     } catch (e) {}
   })();
 
@@ -5916,6 +6247,81 @@ var __C2S_DEBUG__ = false;
           }
         });
       }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Content-script half of the webNavigation.onHistoryStateUpdated emulation above.
+  // Safari delivers no navigation events to the background page, so the page itself
+  // reports its own same-document navigations and the background re-emits them in the
+  // Chrome event shape. Runs only in a content script: an extension page navigating
+  // itself is not a browsing navigation and must not be reported as one.
+  if (typeof window !== "undefined" && typeof location !== "undefined"
+      && !/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) {
+    try {
+      // This half holds NO cross-navigation state. Safari re-injects content scripts on
+      // same-document navigations (measured on GitHub: every Turbo click re-ran this
+      // file) AND gives each injection a fresh isolated world, so neither a closure nor a
+      // property on `window` survives to be compared against — both get re-seeded to the
+      // very URL being detected. So just announce the current URL on every injection and
+      // let the background, which does persist, decide whether it changed.
+      var __lastSent = null;
+      var __navReport = function () {
+        var next = location.href;
+        if (next === __lastSent) return;
+        __lastSent = next;
+        try { chrome.runtime.sendMessage({ __c2sNav: { url: next } }); } catch (e) {}
+      };
+      __navReport();
+      // A content script runs in an ISOLATED WORLD, so patching history.pushState here
+      // never observes the page's own calls — the page holds a different `history`.
+      // Live: GitHub's Turbo router pushes state in the page world and the wrapper below
+      // saw nothing. location.href does reflect the result in both worlds, so watch that
+      // instead. No world:MAIN injection, which would raise the Safari floor to 18.4.
+      //
+      // Watched in short bursts after input rather than on a standing interval: SPA
+      // routing is user-driven, and a permanent timer in every frame of every page is a
+      // real cost for a rare event. Ceiling: a purely programmatic navigation with no
+      // preceding input (a timer-driven redirect) is missed until the next one.
+      var __burstTimer = null;
+      var __burstUntil = 0;
+      var __watch = function () {
+        __burstUntil = Date.now() + 2500;
+        if (__burstTimer) return;
+        try {
+          __burstTimer = setInterval(function () {
+            __navReport();
+            if (Date.now() > __burstUntil) {
+              try { clearInterval(__burstTimer); } catch (e) {}
+              __burstTimer = null;
+            }
+          }, 150);
+        } catch (e) {}
+      };
+      window.addEventListener("popstate", function () { __navReport(); __watch(); });
+      window.addEventListener("hashchange", function () { __navReport(); __watch(); });
+      window.addEventListener("pagehide", function () {
+        try { if (__burstTimer) clearInterval(__burstTimer); } catch (e) {}
+        __burstTimer = null;
+      });
+      try {
+        // Capture phase: the page's own handler usually calls preventDefault and routes.
+        document.addEventListener("click", __watch, true);
+        document.addEventListener("keydown", function (e) {
+          if (e && (e.key === "Enter" || e.key === " ")) __watch();
+        }, true);
+      } catch (e) {}
+      // Covers a navigation the content script itself performs.
+      var __wrapHistory = function (name) {
+        var orig = history[name];
+        if (typeof orig !== "function") return;
+        history[name] = function () {
+          var r = orig.apply(this, arguments);
+          try { setTimeout(__navReport, 0); } catch (e) {}
+          return r;
+        };
+      };
+      __wrapHistory("pushState");
+      __wrapHistory("replaceState");
     } catch (e) { /* ignore */ }
   }
 

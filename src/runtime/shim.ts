@@ -7,9 +7,17 @@ import { walkScripts } from "../input/stage.js";
 
 export const SHIM_FILENAME = "safari-compat-shim.js";
 export const POLYFILL_FILENAME = "browser-polyfill.min.js";
+// Fallback name used when the extension already ships its OWN browser-polyfill.min.js
+// (uBlock Origin does). Writing viaduct's polyfill over that file replaced the exact
+// build the extension's content scripts were compiled against; uBlock's vapi.js then
+// threw at load and every script after it in the content-script list (contentscript.js,
+// the cosmetic filter) never ran. Keep the extension's file intact and load viaduct's
+// under this distinct name instead.
+export const POLYFILL_ALT_FILENAME = "viaduct-browser-polyfill.min.js";
 export const BACKGROUND_PAGE_FILENAME = "background.html";
 export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
+export const USERSCRIPTS_CS_FILENAME = "__viaduct-userscripts.js";
 export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
 
 /**
@@ -23,8 +31,13 @@ export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
 export function writePolyfill(targetDir: string): string | undefined {
   const src = join(TEMPLATE_DIR, POLYFILL_FILENAME);
   if (!existsSync(src)) return undefined;
-  copyFileSync(src, join(targetDir, POLYFILL_FILENAME));
-  return POLYFILL_FILENAME;
+  // Don't clobber the extension's own browser-polyfill.min.js. webextension-polyfill
+  // is idempotent (it no-ops once `browser` exists), so loading viaduct's copy under a
+  // second name alongside the extension's is harmless, whereas overwriting the
+  // extension's build breaks scripts compiled against it.
+  const name = existsSync(join(targetDir, POLYFILL_FILENAME)) ? POLYFILL_ALT_FILENAME : POLYFILL_FILENAME;
+  copyFileSync(src, join(targetDir, name));
+  return name;
 }
 
 /**
@@ -446,22 +459,39 @@ function actionSlot(manifest: Manifest): "action" | "browser_action" | "page_act
   return (manifest.manifest_version ?? 2) === 3 ? "action" : "browser_action";
 }
 
+// True when a background source calls (browser|page)Action.setPopup with a non-empty
+// popup string — i.e. the toolbar button opens a popup wired at runtime. An empty popup
+// (`setPopup({popup:""})`) disables the popup and doesn't count. Loose regex to survive
+// minification: `setPopup(` … `popup:` "<non-empty>" within the same call.
+function setsNonEmptyPopup(src: string): boolean {
+  return /setPopup\s*\(\s*\{[^}]*\bpopup\s*:\s*(["'`])(?!\1)[^"'`]/.test(src);
+}
+
 /** Heuristic: do the manifest's background scripts register an action click handler? */
 function backgroundRegistersActionOnClicked(dir: string, manifest: Manifest): boolean {
   const files: string[] = [];
   const sw = manifest.background?.service_worker;
   if (typeof sw === "string") files.push(sw);
   for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
+  // Two passes over ALL background files, not a per-file short-circuit: viaduct prepends
+  // its own shim to background.scripts, and the shim references onClicked + action without
+  // any setPopup, so a per-file "onClicked here, no setPopup here → true" would fire on the
+  // shim before ever reaching the bundle's own background.js where the setPopup lives.
+  // A non-empty setPopup ANYWHERE means the button is popup-driven (Safari honors setPopup),
+  // so the bridge must not hijack it — that wins over an onClicked registration elsewhere.
+  // Empty setPopup({popup:""}) clears the popup and does not count. (TWP sets popup/popup.html.)
+  let sawOnClicked = false;
   for (const rel of files) {
     const p = join(dir, rel.replace(/^\.?\//, ""));
     if (!existsSync(p)) continue;
     let src: string;
     try { src = readFileSync(p, "utf-8"); } catch { continue; }
+    if (setsNonEmptyPopup(src)) return false;
     // Loose but effective on minified bundles: an onClicked registration alongside an
     // action/browserAction reference. Favors wiring a working button over a miss.
-    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) return true;
+    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) sawOnClicked = true;
   }
-  return false;
+  return sawOnClicked;
 }
 
 /**
@@ -685,14 +715,149 @@ const PAGE_WORLD_INJECT_RE =
  * harmlessly while the MAIN-world content script does the real work. Returns the wired
  * resource paths.
  */
+/**
+ * Give chrome.userScripts a way to actually reach the page.
+ *
+ * The shim's userScripts registry has no way to inject on its own: it lives in the
+ * background, and the background cannot reach a page uninvited. A DECLARED content
+ * script does run, so wire one that reads the published registry out of storage and
+ * evaluates whatever matches its URL. It runs in the isolated world, where
+ * chrome.runtime is available for a manager's own bridge.
+ *
+ * Storage rather than messaging, deliberately: runtime.sendMessage broadcasts to every
+ * listener and the first sendResponse wins, and an extension's own background handler
+ * consumed the request and answered with nothing (live, Tampermonkey). Storage also
+ * survives the background being torn down, so a document_start injector that runs
+ * before the background has woken still finds the scripts.
+ *
+ * Only wired when the extension declares the userScripts permission, so nothing else
+ * gains a content script it never asked for. Call BEFORE transformManifest, which
+ * strips that permission for Safari. Returns the filename, or null when not applicable.
+ */
+export function wireUserScriptsContentScript(
+  dir: string,
+  manifest: Manifest,
+  original: Manifest = manifest,
+): string | null {
+  const perms = [
+    ...(Array.isArray(original.permissions) ? original.permissions : []),
+    ...(Array.isArray(original.optional_permissions) ? original.optional_permissions : []),
+  ];
+  if (!perms.includes("userScripts")) return null;
+
+  const js = `// Injected by viaduct: runs the scripts registered through chrome.userScripts.
+// The registry is read from storage, not requested over runtime.sendMessage: that
+// broadcast reaches every listener, the first sendResponse wins, and the extension's own
+// background handler consumed the request and answered with nothing. Storage also has no
+// boot race — it outlives the background being torn down, so this still finds the scripts
+// when it runs before the background has finished waking.
+(function () {
+  if (window.__viaductUserScriptsRan) return;
+  window.__viaductUserScriptsRan = true;
+  var STORE_KEY = "__viaductUserScripts";
+  function log(msg) { try { console.log("[viaduct:userScripts] " + msg); } catch (e) {} }
+
+  function escapeRe(str) { return String(str).replace(/[.+^\${}()|[\\]\\\\?]/g, "\\\\$&"); }
+  function patternToRe(pattern) {
+    if (pattern === "<all_urls>") return /^(?:https?|file|ftp):\\/\\//;
+    var m = /^(\\*|[a-z][a-z0-9+.-]*):\\/\\/(\\*|(?:\\*\\.)?[^/*]*)(\\/.*)\$/i.exec(pattern);
+    if (!m) return null;
+    var scheme = m[1] === "*" ? "https?" : escapeRe(m[1]);
+    var host = m[2];
+    var hostRe = host === "*" ? "[^/]+"
+      : host.indexOf("*.") === 0 ? "(?:[^/]+\\\\.)?" + escapeRe(host.slice(2))
+      : escapeRe(host);
+    var pathRe = escapeRe(m[3]).replace(/\\*/g, ".*");
+    try { return new RegExp("^" + scheme + ":\\\\/\\\\/" + hostRe + pathRe + "\$"); } catch (e) { return null; }
+  }
+  function globToRe(glob) {
+    try { return new RegExp("^" + escapeRe(glob).replace(/\\*/g, ".*").replace(/\\\\\\?/g, ".") + "\$"); }
+    catch (e) { return null; }
+  }
+  function anyMatch(list, url, toRe) {
+    if (!list || !list.length) return false;
+    for (var i = 0; i < list.length; i++) { var re = toRe(list[i]); if (re && re.test(url)) return true; }
+    return false;
+  }
+  function appliesTo(rec, url, isTop) {
+    if (!isTop && !rec.allFrames) return false;
+    if (!anyMatch(rec.matches, url, patternToRe)) return false;
+    if (anyMatch(rec.excludeMatches, url, patternToRe)) return false;
+    if (rec.includeGlobs && rec.includeGlobs.length && !anyMatch(rec.includeGlobs, url, globToRe)) return false;
+    if (anyMatch(rec.excludeGlobs, url, globToRe)) return false;
+    return true;
+  }
+
+  function exec(s) {
+    try { (0, eval)(s.code); }
+    catch (e) { try { console.error("[viaduct] user script " + s.id + " failed:", e); } catch (e2) {} }
+  }
+  function run(list) {
+    var later = [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (!s || !s.code) continue;
+      if (s.runAt === "document_start" || document.readyState !== "loading") exec(s);
+      else later.push(s);
+    }
+    if (later.length) {
+      document.addEventListener("DOMContentLoaded", function () {
+        for (var j = 0; j < later.length; j++) exec(later[j]);
+      });
+    }
+  }
+
+  // The background may not have registered anything yet when this runs, so poll briefly.
+  var attempts = 0, MAX_ATTEMPTS = 12, RETRY_MS = 250;
+  var url = location.href, isTop = window.top === window;
+  function load() {
+    attempts++;
+    try {
+      chrome.storage.local.get(STORE_KEY, function (res) {
+        var all = (res && res[STORE_KEY]) || [];
+        if (!all.length) {
+          if (attempts < MAX_ATTEMPTS) { setTimeout(load, RETRY_MS); return; }
+          log("no scripts published after " + attempts + " attempts");
+          return;
+        }
+        var mine = [];
+        for (var i = 0; i < all.length; i++) if (appliesTo(all[i], url, isTop)) mine.push(all[i]);
+        log("running " + mine.length + " of " + all.length + " published script(s)");
+        run(mine);
+      });
+    } catch (e) { log("could not read the registry: " + ((e && e.message) || e)); }
+  }
+  log("injector running on " + url);
+  load();
+})();
+`;
+  writeFileSync(join(dir, USERSCRIPTS_CS_FILENAME), js, "utf-8");
+
+  if (!Array.isArray(manifest.content_scripts)) manifest.content_scripts = [];
+  const already = manifest.content_scripts.some(
+    (cs) => Array.isArray(cs.js) && cs.js.includes(USERSCRIPTS_CS_FILENAME),
+  );
+  if (!already) {
+    manifest.content_scripts.push({
+      matches: ["<all_urls>"],
+      js: [USERSCRIPTS_CS_FILENAME],
+      run_at: "document_start",
+      all_frames: true,
+    });
+  }
+  return USERSCRIPTS_CS_FILENAME;
+}
+
 export function wirePageWorldMainInjection(dir: string, manifest: Manifest): string[] {
   if (!Array.isArray(manifest.content_scripts)) manifest.content_scripts = [];
   // Never scan or re-wire viaduct's own injected files.
   const ownFiles: Record<string, true> = {
     [SHIM_FILENAME]: true,
     [POLYFILL_FILENAME]: true,
+    [POLYFILL_ALT_FILENAME]: true,
     [SW_LIFECYCLE_FILENAME]: true,
     [ACTION_HOTKEY_FILENAME]: true,
+    [USERSCRIPTS_CS_FILENAME]: true,
   };
   const targets = new Set<string>();
   for (const file of walkScripts(dir)) {

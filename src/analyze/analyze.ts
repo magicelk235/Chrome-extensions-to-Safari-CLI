@@ -449,7 +449,13 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
     ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
   ];
-  const hasDnr = (manifest.declarative_net_request?.rule_resources?.length ?? 0) > 0;
+  // A DNR permission counts as much as a static ruleset: extensions that build their
+  // rules at runtime (updateDynamicRules/updateSessionRules) ship no rule_resources at
+  // all, and the transform maps the Safari-rejected declarativeNetRequestWithHostAccess
+  // token back onto plain declarativeNetRequest, so their blocking path survives too.
+  const hasDnr =
+    (manifest.declarative_net_request?.rule_resources?.length ?? 0) > 0 ||
+    cbPerms.some((p) => typeof p === "string" && p.startsWith("declarativeNetRequest"));
   if (cbPerms.includes("webRequestBlocking") && !hasDnr) {
     // <all_urls> or an http(s)/any-scheme host wildcard = web-wide blocking intent.
     const BROAD_HOST = /^(?:<all_urls>|\*:\/\/\*\/\*|https?:\/\/\*\/\*)$/;
