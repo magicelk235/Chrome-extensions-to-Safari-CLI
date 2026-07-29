@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -164,6 +164,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // keyboard-command page opens).
     const selfPaged = rewriteSelfPageExtensionUrls(stageDir);
     if (selfPaged > 0) ok(`Rewrote self-page chrome-extension: URLs to runtime.getURL in ${selfPaged} script(s)`);
+
+    // The worker→background-page conversion gives the background a `window`, so bundles
+    // that identify the background by its ABSENCE decide they are a content script and
+    // then quietly refuse every message addressed to the background (Cloaked: "Log in"
+    // spun forever with nothing logged anywhere). Correct that identity in the
+    // background's own sources.
+    const bgIdentity = rewriteBackgroundContextChecks(stageDir, manifest);
+    if (bgIdentity > 0) ok(`Corrected the background-context check in ${bgIdentity} script(s)`);
 
     // Safari extension pages are top-level, so location.ancestorOrigins is an empty (but
     // present) DOMStringList: ancestorOrigins?.[0] is undefined and the trailing string
