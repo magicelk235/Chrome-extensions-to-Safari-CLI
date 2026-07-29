@@ -1014,11 +1014,52 @@ export function unsignedExtensionsAllowed(): boolean | null {
  */
 export function detectXcodeTeam(): string | null {
   const res = run("defaults", ["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"]);
-  if (res.code !== 0) return null;
-  // Boundary after the 10 chars so an over-long token isn't truncated into a
-  // wrong 10-char id; a real Apple team id is exactly 10 alphanumerics.
-  const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})(?![A-Z0-9])"?/g)].map((m) => m[1]);
-  return ids[0] ?? null;
+  if (res.code === 0) {
+    // Boundary after the 10 chars so an over-long token isn't truncated into a
+    // wrong 10-char id; a real Apple team id is exactly 10 alphanumerics.
+    const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})(?![A-Z0-9])"?/g)].map((m) => m[1]);
+    if (ids[0]) return ids[0];
+  }
+  return teamFromKeychain();
+}
+
+/** Cert prefixes Xcode issues for development signing, best first. */
+const SIGNING_CERT_PREFIXES = [
+  "Apple Development",
+  "Mac Developer",
+  "Apple Distribution",
+  "iPhone Developer",
+];
+
+/**
+ * Team ID read off the signing certificate itself, used when Xcode's preference
+ * cache comes up empty. That cache is written asynchronously and stays missing
+ * on real setups where the account is added but no team has been fetched yet, so
+ * an account that can sign perfectly well reads as "not signed in". The
+ * certificate is the better source: it is what codesign consumes, and Apple puts
+ * the team id in the subject's OU.
+ */
+function teamFromKeychain(): string | null {
+  const list = run("security", ["find-identity", "-v", "-p", "codesigning"]);
+  if (list.code !== 0) return null;
+  // Lines look like:  1) <sha1> "Apple Development: me@example.com (XXXXXXXXXX)"
+  const names = [...list.stdout.matchAll(/"([^"]+)"/g)]
+    .map((m) => m[1])
+    .filter((n) => SIGNING_CERT_PREFIXES.some((p) => n.startsWith(p)))
+    .sort(
+      (a, b) =>
+        SIGNING_CERT_PREFIXES.findIndex((p) => a.startsWith(p)) -
+        SIGNING_CERT_PREFIXES.findIndex((p) => b.startsWith(p)),
+    );
+  for (const name of names) {
+    const pem = run("security", ["find-certificate", "-c", name, "-p"]);
+    if (pem.code !== 0 || !pem.stdout.includes("BEGIN CERTIFICATE")) continue;
+    const subject = run("openssl", ["x509", "-noout", "-subject"], { input: pem.stdout });
+    if (subject.code !== 0) continue;
+    const ou = subject.stdout.match(/OU\s*=\s*([A-Z0-9]{10})(?![A-Z0-9])/);
+    if (ou) return ou[1];
+  }
+  return null;
 }
 
 /**
