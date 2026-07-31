@@ -914,6 +914,83 @@ var __C2S_DEBUG__ = false;
   wrapTabsQuery(hasChrome ? chrome : null);
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapTabsQuery(browser);
 
+  // Safari never delivers tabs.onActivated to a converted background page. Probed live
+  // on Honey: the background registers the listener at boot, the user clicks between
+  // three tabs, and not one event arrives while the page is demonstrably alive
+  // (windows.onFocusChanged is just as silent). An extension that keeps "the selected
+  // tab" in a variable fed only by those events therefore never learns one:
+  //   chrome.tabs.onActivated.addListener(e => { selectedTabId = e.tabId; … });
+  //   function getSelectedTab(){ return tabs.get(selectedTabId) }   // Honey, verbatim
+  // Its popup asks for the selected tab, the background calls tabs.get(undefined), and
+  // Safari rejects it with "Invalid call to tabs.get(). The 'tabID' value is invalid" —
+  // so the popup gets no tab id, sends every later message without one, and renders empty.
+  //
+  // Emulate the event by polling the active tab while something is listening. The first
+  // poll always dispatches, which is the part that matters: a Safari background is
+  // restarted constantly, and a freshly woken one has missed every activation there ever
+  // was. If a native onActivated ever does fire (a future Safari, another browser), stand
+  // down for good rather than deliver each activation twice.
+  function emulateTabActivation(ns) {
+    if (!ns || !ns.tabs || !ns.tabs.onActivated || ns.tabs.onActivated.__c2sPolled) return;
+    var ev = ns.tabs.onActivated;
+    if (typeof ev.addListener !== "function") return;
+    var nativeAdd = ev.addListener.bind(ev);
+    var nativeRemove = (typeof ev.removeListener === "function") ? ev.removeListener.bind(ev) : null;
+    var listeners = [];   // the extension's own, called by the poll
+    var native = false;   // Safari stayed quiet? → we keep polling
+    var timer = null, lastId = null, started = false;
+
+    function stopPolling() { if (timer) { try { clearInterval(timer); } catch (e) {} timer = null; } }
+    function fire(info) {
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](info); } catch (e) {}
+      }
+    }
+    function poll() {
+      if (native) { stopPolling(); return; }
+      try {
+        ns.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
+          if (native) { stopPolling(); return; }
+          var t = tabs && tabs[0];
+          if (!t || t.id == null || t.id === lastId) return;
+          var prev = lastId;
+          lastId = t.id;
+          fire(prev == null
+            ? { tabId: t.id, windowId: t.windowId }
+            : { tabId: t.id, windowId: t.windowId, previousTabId: prev });
+        });
+      } catch (e) {}
+    }
+    // Wrap the native listener too: one real event proves the emulation is unnecessary.
+    var markNative = function (info) { native = true; stopPolling(); void info; };
+    try { nativeAdd(markNative); } catch (e) {}
+
+    installOverride(ev, "addListener", function (fn) {
+      if (typeof fn !== "function") return;
+      if (listeners.indexOf(fn) < 0) listeners.push(fn);
+      try { nativeAdd(fn); } catch (e) {}
+      if (!started) {
+        started = true;
+        // A beat after load, so the first poll doesn't race the background's own boot.
+        try { setTimeout(poll, 300); } catch (e) {}
+        try { timer = setInterval(poll, 1500); } catch (e) {}
+      }
+    });
+    installOverride(ev, "removeListener", function (fn) {
+      var i = listeners.indexOf(fn);
+      if (i >= 0) listeners.splice(i, 1);
+      if (nativeRemove) try { nativeRemove(fn); } catch (e) {}
+      if (!listeners.length) stopPolling();
+    });
+    try { ev.__c2sPolled = true; } catch (e) {}
+  }
+  // Background only: this is where a cached "selected tab" lives, and it's the one
+  // context whose poll can't be woken by the user doing something in a page.
+  if (typeof location !== "undefined" && /background\.html$/.test(location.pathname || "")) {
+    emulateTabActivation(hasChrome ? chrome : null);
+    if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) emulateTabActivation(browser);
+  }
+
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   // Only shim when sync is missing or non-functional — never clobber a browser
   // that exposes a real, working storage.sync.
