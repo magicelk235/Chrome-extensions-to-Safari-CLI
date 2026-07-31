@@ -420,39 +420,24 @@ var __C2S_DEBUG__ = false;
   // Safari returns undefined/"" for a falsy path, so callers doing getURL("").slice(...)
   // (uBlock's vAPI.getURL) crash with "undefined is not an object". Wrap getURL so a
   // falsy/relative arg always yields a usable absolute base. Patch each namespace once.
-  // Safari is INCONSISTENT about the extension UUID's case across APIs: it reports it
-  // UPPERCASE in getURL()/sender.url but LOWERCASE in sender.origin. Extensions gate
-  // their own privileged pages with `sender.origin === getURL('').slice(0,-1)`, and
-  // that equality is always false on Safari (lower !== UPPER) → the popup's port is
-  // judged unprivileged → privileged messages (uBlock getPopupData) go unanswered →
-  // blank popup. We can't fix sender.origin (it's an exotic getter returning a fresh
-  // object each read — mutation doesn't stick).
+  // Safari is INCONSISTENT about the extension UUID's case across APIs: getURL(),
+  // location.href and sender.url carry it UPPERCASE, sender.origin LOWERCASE. Bundles
+  // compare getURL's output against both of those:
+  //   uBlock: sender.origin === getURL("").slice(0, -1)   // lowercase on the left
+  //   Honey:  location.href.includes(getURL("/"))         // UPPERCASE on the left
+  // getURL can only return one case. This used to lowercase the host for the empty/root
+  // arg and keep Safari's real case for resource paths, which satisfied uBlock and broke
+  // Honey: inPopover() went false, so its popup treated its own href as the current page
+  // URL, sent every message without a tabId, and the background rejected all of them →
+  // blank popup. Resource paths can't be lowercased either — Safari's resource server is
+  // CASE-SENSITIVE on the UUID host (live-proven on Grammarly), so a lowercased
+  // fetch(getURL("manifest.json")) 404s with "TypeError: Load failed" and the bg init
+  // stalls.
   //
-  // CAUTION (live-proven on Grammarly): Safari's resource server is CASE-SENSITIVE on
-  // the UUID host for fetch()/XHR/<link>. Lowercasing the host in EVERY getURL output
-  // makes `fetch(getURL("manifest.json"))` and module/config loads 404 ("TypeError:
-  // Load failed"), which silently breaks any extension that loads its own bundled
-  // assets at runtime (Grammarly's bg init stalls → popup never initializes).
-  //
-  // The two consumers want opposite cases, but they ask with different args:
-  //   • origin-derivation uses getURL("") / getURL("/")  → needs LOWERCASE (match origin)
-  //   • resource loads use getURL("some/path")           → needs the REAL case (fetch)
-  // So lowercase the host ONLY for the empty/root path; return the genuine Safari
-  // casing for every real resource path. Threads both needs.
-  function lowerHost(u) {
-    if (typeof u !== "string") return u;
-    // Lowercase only the scheme://authority prefix; leave the case-sensitive path.
-    return u.replace(/^(safari-web-extension|chrome-extension|moz-extension):\/\/([^/]+)/i, function (_m, scheme, host) {
-      return scheme.toLowerCase() + "://" + host.toLowerCase();
-    });
-  }
-  // Is this getURL arg an origin-derivation call (empty / root) rather than a real
-  // resource path? Those are the only ones we lowercase.
-  function isRootArg(p) {
-    if (p == null) return true;
-    var s = String(p);
-    return s === "" || s === "/" || s === "./" || s === ".";
-  }
+  // So getURL returns Safari's real case for EVERY arg, and the odd one out —
+  // sender.origin — is aligned to it in senderWithFixedUrl, which hands the listener a
+  // clone. The live sender is an exotic getter whose mutation doesn't stick; a clone's
+  // does.
   function patchGetURL(rt) {
     if (!rt || typeof rt.getURL !== "function" || rt.__c2sGetURL) return;
     var orig = rt.getURL.bind(rt);
@@ -460,13 +445,11 @@ var __C2S_DEBUG__ = false;
     try { base = orig("/") || orig("manifest.json").replace(/manifest\.json[^/]*$/, "") || ""; } catch (e) {}
     if (!base) { try { base = (location && location.origin ? location.origin + "/" : ""); } catch (e) {} }
     function wrapped(p) {
-      var root = isRootArg(p);
       var r = null;
       try { r = orig(p == null ? "" : p); } catch (e) {}
-      if (r) return root ? lowerHost(r) : r; // real resource paths keep Safari's real host case
-      // Safari gave us nothing usable: build from the base (only the root case hits this).
-      var path = (p == null ? "" : String(p)).replace(/^\.?\//, "");
-      return (root ? lowerHost(base) : base) + path;
+      if (r) return r;
+      // Safari gave us nothing usable (only the empty/root arg does that): build from base.
+      return base + (p == null ? "" : String(p)).replace(/^\.?\//, "");
     }
     try { rt.getURL = wrapped; rt.__c2sGetURL = true; } catch (e) {
       try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}
@@ -748,22 +731,32 @@ var __C2S_DEBUG__ = false;
     var url;
     try { url = sender.url; } catch (e) { return sender; }
     if (typeof url !== "string") return sender;
-    // Cut at the first "?" or "#". Nothing to strip → return the sender untouched.
+    // Cut at the first "?" or "#".
     var cut = url.length;
     var q = url.indexOf("?"); if (q >= 0) cut = q;
     var h = url.indexOf("#"); if (h >= 0 && h < cut) cut = h;
-    if (cut === url.length) return sender;
     var bare = url.slice(0, cut);
-    // Only strip our OWN extension pages — never a content-script's http(s) sender.
-    // canon (getURL("") sans trailing slash) is lowercased by patchGetURL; sender.url's
-    // host keeps Safari's real case, so compare case-insensitively.
+    // Only touch our OWN extension pages — never a content script's http(s) sender.
+    // Compare case-insensitively: Safari hands out the UUID host in different cases per
+    // API, which is the very thing being normalized here.
     if (bare.toLowerCase().indexOf(canon.toLowerCase()) !== 0) return sender;
-    // Safari's sender is a frozen exotic getter (in-place url rewrite doesn't stick, same
-    // as sender.origin — proven live), so hand the listener a shallow clone: copy every own
+    // Safari reports sender.origin with a LOWERCASE UUID host while getURL() uses the
+    // real (upper) case, so a bundle gating its own pages with
+    //   sender.origin === getURL("").slice(0, -1)          // uBlock, verbatim
+    // never matches and the popup is judged unprivileged → getPopupData goes unanswered
+    // → blank popup. Align it to getURL's case.
+    var origin;
+    try { origin = sender.origin; } catch (e) {}
+    var fixOrigin = typeof origin === "string" && origin !== canon &&
+      origin.toLowerCase() === canon.toLowerCase();
+    if (cut === url.length && !fixOrigin) return sender; // already normal → no clone needed
+    // Safari's sender is a frozen exotic getter (an in-place rewrite of url or origin
+    // doesn't stick — proven live), so hand the listener a shallow clone: copy every own
     // prop (tab, id, frameId, documentId, …) so consumers reading them still work.
     var clone = {};
     try { for (var k in sender) { try { clone[k] = sender[k]; } catch (e) {} } } catch (e) {}
     clone.url = bare;
+    if (fixOrigin) clone.origin = canon;
     return clone;
   }
 
