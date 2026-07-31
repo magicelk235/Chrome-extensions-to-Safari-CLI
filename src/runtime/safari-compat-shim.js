@@ -5451,6 +5451,17 @@ var __C2S_DEBUG__ = false;
       function selfSender() {
         var s = {}; try { s.id = probe.runtime.id; } catch (e) {}
         try { if (typeof location !== "undefined") { s.url = location.href; s.origin = location.origin; } } catch (e) {}
+        // An extension page's href can carry a query getURL(path) never has — a side panel
+        // gets ?tabId=<n> (the panel-doc block below writes it in, since Safari doesn't),
+        // and bundles allow-list their own pages by exact-matching sender.url against
+        // getURL:
+        //   if (allowedSenderURL.includes(sender.url)) handle;   // Dark Reader, verbatim
+        // Native delivery already gets the query stripped by senderWithFixedUrl; this relay
+        // builds its sender from location.href instead, so without the same rule the page's
+        // RPCs (GET_DATA, CHANGE_SETTINGS…) are dropped with no sendResponse — the await
+        // never settles, so the UI sits on "Loading, please wait" and every button is dead.
+        // One rule, both transports.
+        try { s = senderWithFixedUrl(s, canonicalOrigin(probe.runtime)) || s; } catch (e) {}
         return s;
       }
       function rm(k) { try { store.local.remove(k); } catch (e) {} }
