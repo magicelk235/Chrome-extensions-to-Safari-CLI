@@ -725,11 +725,14 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
   }
 
-  // Safari's popup `sender.url` carries a `?tabId=<n>` query that getURL(path) never has.
-  // LIVE-PROVEN (Dark Reader on Safari 18): the SAME popup sends some messages as the bare
+  // An extension page's `sender.url` can carry a query that getURL(path) never has. The
+  // panel-doc block far below writes ?tabId=<n> into a side panel's URL (Safari opens one
+  // as a popover with no query), and a page can be opened with one of its own. Observed
+  // live on Dark Reader (Safari 18), where the SAME popup sent some messages as the bare
   //   safari-web-extension://<uuid>/ui/popup/index.html
   // and others (e.g. subscribe-to-changes) as
   //   safari-web-extension://<uuid>/ui/popup/index.html?tabId=188
+  // — the split being before and after that replaceState landed.
   // Bundles allow-list their own pages by EXACT-MATCHING sender.url against getURL(path):
   //   allowedSenderURL = [getURL("/ui/popup/index.html"), …];
   //   if (allowedSenderURL.includes(sender.url)) handle;      // Dark Reader, verbatim
@@ -6166,10 +6169,33 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
     return false;
   };
+  // …but only a SIDE PANEL gets that param. Chrome puts no query on an action popup's
+  // URL, so injecting one there invents a Chrome behavior that does not exist, and it
+  // costs real extensions: a popup that routes its own messages by comparing its href to
+  // getURL() sends them to the wrong place the moment the query lands.
+  //   let service = "messages:cs";
+  //   window.location.href === chrome.runtime.getURL("/popover/popover.html") &&
+  //     (service = "messages:popover");        // Honey, verbatim
+  // The background's messages:cs listener bails on a sender with no sender.tab, which is
+  // every popup, so the reply never comes and the popup stays blank. The replaceState
+  // below also lands a turn late (after tabs.query resolves), so the same popup compares
+  // equal before it and unequal after — that is the "some messages carry ?tabId, some
+  // don't" split seen live on Dark Reader.
+  var c2sIsSidePanelDoc = function () {
+    if (typeof location === "undefined") return false;
+    var path = (location.pathname || "").replace(/^\//, "").toLowerCase();
+    if (/sidepanel/i.test(path)) return true;
+    try {
+      var m = (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest)
+        ? chrome.runtime.getManifest() : null;
+      var p = m && m.side_panel && m.side_panel.default_path;
+      return typeof p === "string" && p.replace(/^\//, "").toLowerCase() === path;
+    } catch (e) { return false; }
+  };
   if (typeof window !== "undefined" && typeof location !== "undefined" && c2sIsPanelDoc()) {
     try {
       var hasParam = !!new URLSearchParams(location.search).get("tabId");
-      if (!hasParam) {
+      if (!hasParam && c2sIsSidePanelDoc()) {
         var c2sTabId = null;
         var qns = (typeof chrome !== "undefined" && chrome.tabs) ? chrome.tabs : (api && api.tabs);
         var assign = function (r) {
