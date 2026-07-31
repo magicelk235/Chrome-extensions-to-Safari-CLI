@@ -420,39 +420,24 @@ var __C2S_DEBUG__ = false;
   // Safari returns undefined/"" for a falsy path, so callers doing getURL("").slice(...)
   // (uBlock's vAPI.getURL) crash with "undefined is not an object". Wrap getURL so a
   // falsy/relative arg always yields a usable absolute base. Patch each namespace once.
-  // Safari is INCONSISTENT about the extension UUID's case across APIs: it reports it
-  // UPPERCASE in getURL()/sender.url but LOWERCASE in sender.origin. Extensions gate
-  // their own privileged pages with `sender.origin === getURL('').slice(0,-1)`, and
-  // that equality is always false on Safari (lower !== UPPER) → the popup's port is
-  // judged unprivileged → privileged messages (uBlock getPopupData) go unanswered →
-  // blank popup. We can't fix sender.origin (it's an exotic getter returning a fresh
-  // object each read — mutation doesn't stick).
+  // Safari is INCONSISTENT about the extension UUID's case across APIs: getURL(),
+  // location.href and sender.url carry it UPPERCASE, sender.origin LOWERCASE. Bundles
+  // compare getURL's output against both of those:
+  //   uBlock: sender.origin === getURL("").slice(0, -1)   // lowercase on the left
+  //   Honey:  location.href.includes(getURL("/"))         // UPPERCASE on the left
+  // getURL can only return one case. This used to lowercase the host for the empty/root
+  // arg and keep Safari's real case for resource paths, which satisfied uBlock and broke
+  // Honey: inPopover() went false, so its popup treated its own href as the current page
+  // URL, sent every message without a tabId, and the background rejected all of them →
+  // blank popup. Resource paths can't be lowercased either — Safari's resource server is
+  // CASE-SENSITIVE on the UUID host (live-proven on Grammarly), so a lowercased
+  // fetch(getURL("manifest.json")) 404s with "TypeError: Load failed" and the bg init
+  // stalls.
   //
-  // CAUTION (live-proven on Grammarly): Safari's resource server is CASE-SENSITIVE on
-  // the UUID host for fetch()/XHR/<link>. Lowercasing the host in EVERY getURL output
-  // makes `fetch(getURL("manifest.json"))` and module/config loads 404 ("TypeError:
-  // Load failed"), which silently breaks any extension that loads its own bundled
-  // assets at runtime (Grammarly's bg init stalls → popup never initializes).
-  //
-  // The two consumers want opposite cases, but they ask with different args:
-  //   • origin-derivation uses getURL("") / getURL("/")  → needs LOWERCASE (match origin)
-  //   • resource loads use getURL("some/path")           → needs the REAL case (fetch)
-  // So lowercase the host ONLY for the empty/root path; return the genuine Safari
-  // casing for every real resource path. Threads both needs.
-  function lowerHost(u) {
-    if (typeof u !== "string") return u;
-    // Lowercase only the scheme://authority prefix; leave the case-sensitive path.
-    return u.replace(/^(safari-web-extension|chrome-extension|moz-extension):\/\/([^/]+)/i, function (_m, scheme, host) {
-      return scheme.toLowerCase() + "://" + host.toLowerCase();
-    });
-  }
-  // Is this getURL arg an origin-derivation call (empty / root) rather than a real
-  // resource path? Those are the only ones we lowercase.
-  function isRootArg(p) {
-    if (p == null) return true;
-    var s = String(p);
-    return s === "" || s === "/" || s === "./" || s === ".";
-  }
+  // So getURL returns Safari's real case for EVERY arg, and the odd one out —
+  // sender.origin — is aligned to it in senderWithFixedUrl, which hands the listener a
+  // clone. The live sender is an exotic getter whose mutation doesn't stick; a clone's
+  // does.
   function patchGetURL(rt) {
     if (!rt || typeof rt.getURL !== "function" || rt.__c2sGetURL) return;
     var orig = rt.getURL.bind(rt);
@@ -460,13 +445,11 @@ var __C2S_DEBUG__ = false;
     try { base = orig("/") || orig("manifest.json").replace(/manifest\.json[^/]*$/, "") || ""; } catch (e) {}
     if (!base) { try { base = (location && location.origin ? location.origin + "/" : ""); } catch (e) {} }
     function wrapped(p) {
-      var root = isRootArg(p);
       var r = null;
       try { r = orig(p == null ? "" : p); } catch (e) {}
-      if (r) return root ? lowerHost(r) : r; // real resource paths keep Safari's real host case
-      // Safari gave us nothing usable: build from the base (only the root case hits this).
-      var path = (p == null ? "" : String(p)).replace(/^\.?\//, "");
-      return (root ? lowerHost(base) : base) + path;
+      if (r) return r;
+      // Safari gave us nothing usable (only the empty/root arg does that): build from base.
+      return base + (p == null ? "" : String(p)).replace(/^\.?\//, "");
     }
     try { rt.getURL = wrapped; rt.__c2sGetURL = true; } catch (e) {
       try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}
@@ -725,11 +708,14 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
   }
 
-  // Safari's popup `sender.url` carries a `?tabId=<n>` query that getURL(path) never has.
-  // LIVE-PROVEN (Dark Reader on Safari 18): the SAME popup sends some messages as the bare
+  // An extension page's `sender.url` can carry a query that getURL(path) never has. The
+  // panel-doc block far below writes ?tabId=<n> into a side panel's URL (Safari opens one
+  // as a popover with no query), and a page can be opened with one of its own. Observed
+  // live on Dark Reader (Safari 18), where the SAME popup sent some messages as the bare
   //   safari-web-extension://<uuid>/ui/popup/index.html
   // and others (e.g. subscribe-to-changes) as
   //   safari-web-extension://<uuid>/ui/popup/index.html?tabId=188
+  // — the split being before and after that replaceState landed.
   // Bundles allow-list their own pages by EXACT-MATCHING sender.url against getURL(path):
   //   allowedSenderURL = [getURL("/ui/popup/index.html"), …];
   //   if (allowedSenderURL.includes(sender.url)) handle;      // Dark Reader, verbatim
@@ -745,22 +731,32 @@ var __C2S_DEBUG__ = false;
     var url;
     try { url = sender.url; } catch (e) { return sender; }
     if (typeof url !== "string") return sender;
-    // Cut at the first "?" or "#". Nothing to strip → return the sender untouched.
+    // Cut at the first "?" or "#".
     var cut = url.length;
     var q = url.indexOf("?"); if (q >= 0) cut = q;
     var h = url.indexOf("#"); if (h >= 0 && h < cut) cut = h;
-    if (cut === url.length) return sender;
     var bare = url.slice(0, cut);
-    // Only strip our OWN extension pages — never a content-script's http(s) sender.
-    // canon (getURL("") sans trailing slash) is lowercased by patchGetURL; sender.url's
-    // host keeps Safari's real case, so compare case-insensitively.
+    // Only touch our OWN extension pages — never a content script's http(s) sender.
+    // Compare case-insensitively: Safari hands out the UUID host in different cases per
+    // API, which is the very thing being normalized here.
     if (bare.toLowerCase().indexOf(canon.toLowerCase()) !== 0) return sender;
-    // Safari's sender is a frozen exotic getter (in-place url rewrite doesn't stick, same
-    // as sender.origin — proven live), so hand the listener a shallow clone: copy every own
+    // Safari reports sender.origin with a LOWERCASE UUID host while getURL() uses the
+    // real (upper) case, so a bundle gating its own pages with
+    //   sender.origin === getURL("").slice(0, -1)          // uBlock, verbatim
+    // never matches and the popup is judged unprivileged → getPopupData goes unanswered
+    // → blank popup. Align it to getURL's case.
+    var origin;
+    try { origin = sender.origin; } catch (e) {}
+    var fixOrigin = typeof origin === "string" && origin !== canon &&
+      origin.toLowerCase() === canon.toLowerCase();
+    if (cut === url.length && !fixOrigin) return sender; // already normal → no clone needed
+    // Safari's sender is a frozen exotic getter (an in-place rewrite of url or origin
+    // doesn't stick — proven live), so hand the listener a shallow clone: copy every own
     // prop (tab, id, frameId, documentId, …) so consumers reading them still work.
     var clone = {};
     try { for (var k in sender) { try { clone[k] = sender[k]; } catch (e) {} } } catch (e) {}
     clone.url = bare;
+    if (fixOrigin) clone.origin = canon;
     return clone;
   }
 
@@ -917,6 +913,96 @@ var __C2S_DEBUG__ = false;
   }
   wrapTabsQuery(hasChrome ? chrome : null);
   if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) wrapTabsQuery(browser);
+
+  // Safari never delivers tabs.onActivated to a converted background page. Probed live
+  // on Honey: the background registers the listener at boot, the user clicks between
+  // three tabs, and not one event arrives while the page is demonstrably alive
+  // (windows.onFocusChanged is just as silent). An extension that keeps "the selected
+  // tab" in a variable fed only by those events therefore never learns one:
+  //   chrome.tabs.onActivated.addListener(e => { selectedTabId = e.tabId; … });
+  //   function getSelectedTab(){ return tabs.get(selectedTabId) }   // Honey, verbatim
+  // Its popup asks for the selected tab, the background calls tabs.get(undefined), and
+  // Safari rejects it with "Invalid call to tabs.get(). The 'tabID' value is invalid" —
+  // so the popup gets no tab id, sends every later message without one, and renders empty.
+  //
+  // Emulate the event by polling the active tab while something is listening. The first
+  // poll always dispatches, which is the part that matters: a Safari background is
+  // restarted constantly, and a freshly woken one has missed every activation there ever
+  // was. If a native onActivated ever does fire (a future Safari, another browser), stand
+  // down for good rather than deliver each activation twice.
+  function emulateTabActivation(ns) {
+    if (!ns || !ns.tabs || !ns.tabs.onActivated || ns.tabs.onActivated.__c2sPolled) return;
+    var ev = ns.tabs.onActivated;
+    if (typeof ev.addListener !== "function") return;
+    var nativeAdd = ev.addListener.bind(ev);
+    var nativeRemove = (typeof ev.removeListener === "function") ? ev.removeListener.bind(ev) : null;
+    var listeners = [];   // the extension's own, called by the poll
+    var native = false;   // Safari stayed quiet? → we keep polling
+    var timer = null, lastId = null;
+
+    function stopPolling() { if (timer) { try { clearInterval(timer); } catch (e) {} timer = null; } }
+    function startPolling() {
+      if (native || timer) return;
+      // A beat after load, so the first poll doesn't race the background's own boot.
+      try { setTimeout(poll, 300); } catch (e) {}
+      try { timer = setInterval(poll, 1500); } catch (e) {}
+    }
+    function fire(info) {
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](info); } catch (e) {}
+      }
+    }
+    function poll() {
+      if (native) { stopPolling(); return; }
+      try {
+        ns.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
+          if (native) { stopPolling(); return; }
+          var t = tabs && tabs[0];
+          if (!t || t.id == null || t.id === lastId) return;
+          lastId = t.id;
+          // Chrome's activeInfo is {tabId, windowId} and nothing else, so that is all we
+          // synthesize. (previousTabId is Firefox's addition, and nothing needs it here.)
+          fire({ tabId: t.id, windowId: t.windowId });
+        });
+      } catch (e) {}
+    }
+    // Wrap the native listener too: one real event proves the emulation is unnecessary.
+    var markNative = function (info) { native = true; stopPolling(); void info; };
+    try { nativeAdd(markNative); } catch (e) {}
+
+    installOverride(ev, "addListener", function (fn) {
+      if (typeof fn !== "function") return;
+      if (listeners.indexOf(fn) < 0) listeners.push(fn);
+      try { nativeAdd(fn); } catch (e) {}
+      startPolling();
+    });
+    installOverride(ev, "removeListener", function (fn) {
+      var i = listeners.indexOf(fn);
+      if (i >= 0) listeners.splice(i, 1);
+      if (nativeRemove) try { nativeRemove(fn); } catch (e) {}
+      if (!listeners.length) stopPolling();
+    });
+    try { ev.__c2sPolled = true; } catch (e) {}
+  }
+  // Background only: this is where a cached "selected tab" lives, and it's the one
+  // context whose poll can't be woken by the user doing something in a page. The
+  // converted MV3 background is always background.html; an MV2 bundle keeps whatever
+  // page it declared, so ask the manifest as well rather than skipping it in silence.
+  function c2sIsBackgroundDoc() {
+    if (typeof location === "undefined") return false;
+    var path = (location.pathname || "").replace(/^\//, "").toLowerCase();
+    if (/(^|\/)background\.html$/.test(path)) return true;
+    try {
+      var m = (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest)
+        ? chrome.runtime.getManifest() : null;
+      var bp = m && m.background && m.background.page;
+      return typeof bp === "string" && bp.replace(/^\//, "").toLowerCase() === path;
+    } catch (e) { return false; }
+  }
+  if (c2sIsBackgroundDoc()) {
+    emulateTabActivation(hasChrome ? chrome : null);
+    if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) emulateTabActivation(browser);
+  }
 
   // storage.sync has no iCloud sync in Safari; route it to local so data persists.
   // Only shim when sync is missing or non-functional — never clobber a browser
@@ -5451,6 +5537,17 @@ var __C2S_DEBUG__ = false;
       function selfSender() {
         var s = {}; try { s.id = probe.runtime.id; } catch (e) {}
         try { if (typeof location !== "undefined") { s.url = location.href; s.origin = location.origin; } } catch (e) {}
+        // An extension page's href can carry a query getURL(path) never has — a side panel
+        // gets ?tabId=<n> (the panel-doc block below writes it in, since Safari doesn't),
+        // and bundles allow-list their own pages by exact-matching sender.url against
+        // getURL:
+        //   if (allowedSenderURL.includes(sender.url)) handle;   // Dark Reader, verbatim
+        // Native delivery already gets the query stripped by senderWithFixedUrl; this relay
+        // builds its sender from location.href instead, so without the same rule the page's
+        // RPCs (GET_DATA, CHANGE_SETTINGS…) are dropped with no sendResponse — the await
+        // never settles, so the UI sits on "Loading, please wait" and every button is dead.
+        // One rule, both transports.
+        try { s = senderWithFixedUrl(s, canonicalOrigin(probe.runtime)) || s; } catch (e) {}
         return s;
       }
       function rm(k) { try { store.local.remove(k); } catch (e) {} }
@@ -6155,10 +6252,33 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
     return false;
   };
+  // …but only a SIDE PANEL gets that param. Chrome puts no query on an action popup's
+  // URL, so injecting one there invents a Chrome behavior that does not exist, and it
+  // costs real extensions: a popup that routes its own messages by comparing its href to
+  // getURL() sends them to the wrong place the moment the query lands.
+  //   let service = "messages:cs";
+  //   window.location.href === chrome.runtime.getURL("/popover/popover.html") &&
+  //     (service = "messages:popover");        // Honey, verbatim
+  // The background's messages:cs listener bails on a sender with no sender.tab, which is
+  // every popup, so the reply never comes and the popup stays blank. The replaceState
+  // below also lands a turn late (after tabs.query resolves), so the same popup compares
+  // equal before it and unequal after — that is the "some messages carry ?tabId, some
+  // don't" split seen live on Dark Reader.
+  var c2sIsSidePanelDoc = function () {
+    if (typeof location === "undefined") return false;
+    var path = (location.pathname || "").replace(/^\//, "").toLowerCase();
+    if (/sidepanel/i.test(path)) return true;
+    try {
+      var m = (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest)
+        ? chrome.runtime.getManifest() : null;
+      var p = m && m.side_panel && m.side_panel.default_path;
+      return typeof p === "string" && p.replace(/^\//, "").toLowerCase() === path;
+    } catch (e) { return false; }
+  };
   if (typeof window !== "undefined" && typeof location !== "undefined" && c2sIsPanelDoc()) {
     try {
       var hasParam = !!new URLSearchParams(location.search).get("tabId");
-      if (!hasParam) {
+      if (!hasParam && c2sIsSidePanelDoc()) {
         var c2sTabId = null;
         var qns = (typeof chrome !== "undefined" && chrome.tabs) ? chrome.tabs : (api && api.tabs);
         var assign = function (r) {
