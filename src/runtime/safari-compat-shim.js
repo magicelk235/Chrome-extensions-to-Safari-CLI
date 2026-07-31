@@ -938,9 +938,15 @@ var __C2S_DEBUG__ = false;
     var nativeRemove = (typeof ev.removeListener === "function") ? ev.removeListener.bind(ev) : null;
     var listeners = [];   // the extension's own, called by the poll
     var native = false;   // Safari stayed quiet? → we keep polling
-    var timer = null, lastId = null, started = false;
+    var timer = null, lastId = null;
 
     function stopPolling() { if (timer) { try { clearInterval(timer); } catch (e) {} timer = null; } }
+    function startPolling() {
+      if (native || timer) return;
+      // A beat after load, so the first poll doesn't race the background's own boot.
+      try { setTimeout(poll, 300); } catch (e) {}
+      try { timer = setInterval(poll, 1500); } catch (e) {}
+    }
     function fire(info) {
       for (var i = 0; i < listeners.length; i++) {
         try { listeners[i](info); } catch (e) {}
@@ -953,11 +959,10 @@ var __C2S_DEBUG__ = false;
           if (native) { stopPolling(); return; }
           var t = tabs && tabs[0];
           if (!t || t.id == null || t.id === lastId) return;
-          var prev = lastId;
           lastId = t.id;
-          fire(prev == null
-            ? { tabId: t.id, windowId: t.windowId }
-            : { tabId: t.id, windowId: t.windowId, previousTabId: prev });
+          // Chrome's activeInfo is {tabId, windowId} and nothing else, so that is all we
+          // synthesize. (previousTabId is Firefox's addition, and nothing needs it here.)
+          fire({ tabId: t.id, windowId: t.windowId });
         });
       } catch (e) {}
     }
@@ -969,12 +974,7 @@ var __C2S_DEBUG__ = false;
       if (typeof fn !== "function") return;
       if (listeners.indexOf(fn) < 0) listeners.push(fn);
       try { nativeAdd(fn); } catch (e) {}
-      if (!started) {
-        started = true;
-        // A beat after load, so the first poll doesn't race the background's own boot.
-        try { setTimeout(poll, 300); } catch (e) {}
-        try { timer = setInterval(poll, 1500); } catch (e) {}
-      }
+      startPolling();
     });
     installOverride(ev, "removeListener", function (fn) {
       var i = listeners.indexOf(fn);
@@ -985,8 +985,21 @@ var __C2S_DEBUG__ = false;
     try { ev.__c2sPolled = true; } catch (e) {}
   }
   // Background only: this is where a cached "selected tab" lives, and it's the one
-  // context whose poll can't be woken by the user doing something in a page.
-  if (typeof location !== "undefined" && /background\.html$/.test(location.pathname || "")) {
+  // context whose poll can't be woken by the user doing something in a page. The
+  // converted MV3 background is always background.html; an MV2 bundle keeps whatever
+  // page it declared, so ask the manifest as well rather than skipping it in silence.
+  function c2sIsBackgroundDoc() {
+    if (typeof location === "undefined") return false;
+    var path = (location.pathname || "").replace(/^\//, "").toLowerCase();
+    if (/(^|\/)background\.html$/.test(path)) return true;
+    try {
+      var m = (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest)
+        ? chrome.runtime.getManifest() : null;
+      var bp = m && m.background && m.background.page;
+      return typeof bp === "string" && bp.replace(/^\//, "").toLowerCase() === path;
+    } catch (e) { return false; }
+  }
+  if (c2sIsBackgroundDoc()) {
     emulateTabActivation(hasChrome ? chrome : null);
     if (typeof browser !== "undefined" && (!hasChrome || browser !== chrome)) emulateTabActivation(browser);
   }
