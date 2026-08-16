@@ -12,7 +12,7 @@ import { printIssues, countBlocking, summarizeManifestChanges, buildReportMarkdo
 import { run, info, ok, warn, fail, color, commandExists, setVerbose, setQuiet } from "./util.js";
 import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./build/installer.js";
 import { detectXcodeTeam, defaultBundleId, deriveAppName } from "./build/packager.js";
-import { verifyInSafari } from "./build/verify.js";
+import { verifyInSafari, verifySigning } from "./build/verify.js";
 import { isUrl, downloadExtension } from "./input/download.js";
 import type { Platforms } from "./types.js";
 
@@ -156,7 +156,10 @@ OPTIONS
       --team <id>           Sign with an Apple Developer Team ID (real signing → the
                             extension persists across Safari quits; no unsigned toggle).
                             Use --team auto (or plain --install) to auto-detect the team
-                            from Xcode. Omit for ad-hoc signing. Free personal teams expire ~7 days.
+                            from Xcode or your signing certificate. The signature is
+                            checked against the built app, so a run that asks for a team
+                            and comes out ad-hoc fails. Omit for ad-hoc signing. Free
+                            personal teams expire ~7 days.
       --no-shim             Do not generate/inject the compatibility shim
       --no-oauth-bridge     Do not wire the Safari OAuth/externally_connectable bridge
       --keep-module         Keep background.type:"module" (default strips it)
@@ -478,15 +481,18 @@ async function main(): Promise<void> {
     }
   }
 
-  // Team detection is the same for every input; do it once up front.
+  // Team detection is the same for every input; do it once up front. Remember
+  // whether a team was asked for even after the fallback clears it, so --verify
+  // can tell "ad-hoc because you asked" from "ad-hoc because we gave up".
+  const teamRequested = !values.analyze && (values.team !== undefined || Boolean(values.install));
   let team = values.team;
   if (!values.analyze && (team === "auto" || (team === undefined && values.install))) {
     const detected = detectXcodeTeam();
     if (detected) {
       team = detected;
-      info(`Auto-detected Apple Team ID ${detected} from Xcode → team-signing (persists across Safari quits).`);
+      info(`Auto-detected Apple Team ID ${detected} → team-signing (persists across Safari quits).`);
     } else {
-      if (team === "auto") warn("No Apple team found in Xcode; falling back to ad-hoc signing.");
+      if (team === "auto") warn("No Apple team found in Xcode or the keychain; falling back to ad-hoc signing.");
       team = undefined;
     }
   }
@@ -613,6 +619,16 @@ async function main(): Promise<void> {
       // The build succeeded but the requested install didn't land — that's a failure
       // for the user's intent, so exit non-zero (the warning already printed above).
       if (result.installFailed) anyFailed = true;
+
+      // Same category, and deliberately not behind --verify: a run that asked for
+      // team signing and produced an ad-hoc bundle did not do what it was asked.
+      // Detection only predicts how the build will be signed, so read the signature
+      // back off the artifact — an ad-hoc install looks perfectly fine right up until
+      // Safari next quits and drops the extension.
+      const signedArtifact = result.installedAppPath ?? result.appPath;
+      if (teamRequested && signedArtifact) {
+        if (!verifySigning(signedArtifact, { wantsTeam: true, teamId: team })) anyFailed = true;
+      }
 
       if (values.verify) {
         if (result.installedAppPath && result.resolvedBundleId) {

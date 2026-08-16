@@ -258,11 +258,13 @@ The default (without `--ci`) symlinks resources for live development edits; use
     --no-build          Generate the Xcode project but do not run xcodebuild
     --open-xcode        Open the generated .xcodeproj in Xcode when done
     --install           Install the built app to ~/Applications + register w/ Safari
+    --verify            After --install, check Safari registered/enabled it
     --install-dir <dir> Install target directory (default: ~/Applications)
     --uninstall <name>  Remove the installed <name>.app + unregister it
     --no-safari-restart With --install, don't quit/relaunch Safari or set the toggle
     --team [<id>]       Sign with an Apple Team ID; --team auto (or plain --install)
-                        auto-detects it from Xcode. Omit for ad-hoc signing.
+                        auto-detects it from Xcode or your signing certificate.
+                        Omit for ad-hoc signing.
     --no-shim           Do not generate/inject the compatibility shim
     --no-oauth-bridge   Do not wire the Safari OAuth/externally_connectable bridge
     --keep-module       Keep background.type:"module" (default strips it)
@@ -318,9 +320,16 @@ viaduct ./my-extension.zip --install --team auto # same, explicit
 viaduct ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
 ```
 
-Auto-detection reads the team cached by Xcode (`IDEProvisioningTeamByIdentifier`
-in `com.apple.dt.Xcode`); it requires an Apple account signed into Xcode. If no
-team is found, the build falls back to ad-hoc signing.
+Auto-detection first reads the team Xcode cached
+(`IDEProvisioningTeamByIdentifier` in `com.apple.dt.Xcode`), then falls back to
+the codesigning identity in your keychain, so an Apple account that can sign is
+enough even when Xcode's cache is empty. If neither turns up a team, the build
+falls back to ad-hoc signing.
+
+Signing is not taken on trust. Whenever a team is asked for, the signature is
+read back off the built app and checked, so a run that quietly came out ad-hoc
+fails instead of handing you an extension that disappears the next time Safari
+quits. Ad-hoc builds (no `--team`) are left alone.
 
 A free personal Apple team works, but its provisioning profile expires about
 every 7 days — re-run the command to re-sign. A paid Developer Program account

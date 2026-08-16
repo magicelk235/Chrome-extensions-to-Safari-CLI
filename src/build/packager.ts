@@ -1005,12 +1005,12 @@ export function unsignedExtensionsAllowed(): boolean | null {
 }
 
 /**
- * Best-effort read of an Apple Developer Team ID cached by Xcode. When an Apple
- * account is signed into Xcode it records each team under
- * IDEProvisioningTeamByIdentifier in com.apple.dt.Xcode (keyed by Apple ID). We
- * return the first 10-char team id we can parse, so the tool can team-sign
- * without the user knowing or passing the id. Returns null when no account is
- * signed in or the value can't be read.
+ * Best-effort read of an Apple Developer Team ID, so the tool can team-sign
+ * without the user knowing or passing the id. Two sources, tried in order: the
+ * team Xcode caches under IDEProvisioningTeamByIdentifier in com.apple.dt.Xcode
+ * (keyed by Apple ID), then the codesigning identity in the keychain. Returns
+ * the first 10-char team id it can parse, and null only when neither source
+ * yields one.
  */
 export function detectXcodeTeam(): string | null {
   const res = run("defaults", ["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"]);

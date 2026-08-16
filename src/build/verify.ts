@@ -1,4 +1,6 @@
-import { run, info, ok, warn } from "../util.js";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { run, info, ok, warn, fail } from "../util.js";
 import { pluginkitStatus } from "./packager.js";
 import { bundleRegistered } from "./installer.js";
 
@@ -71,4 +73,113 @@ export function verifyInSafari(bundleId: string): VerifyResult {
     ok("Extension is registered with Safari." + (enabled ? " Enabled." : " (Enable it in Settings → Extensions if not already.)"));
   }
   return { registered, enabled };
+}
+
+/** What a built bundle's signature actually is, read back off the artifact. */
+export interface SigningInfo {
+  /** Ad-hoc: Safari disables the extension every time it quits. */
+  adhoc: boolean;
+  /** Team the artifact carries, when it carries one. */
+  teamId: string | null;
+}
+
+/** What the run asked signing to be, so the artifact can be held to it. */
+export interface SigningExpectation {
+  /** A team was asked for: `--team <id>`, `--team auto`, or plain `--install`. */
+  wantsTeam: boolean;
+  /** The team detection resolved; absent when it found none. */
+  teamId?: string;
+}
+
+export interface SigningVerdict {
+  ok: boolean;
+  level: "ok" | "warn" | "fail";
+  message: string;
+}
+
+/**
+ * Parse a `codesign -dvv` report. Ad-hoc shows up two ways depending on the
+ * bundle — a bare `Signature=adhoc` line and the CodeDirectory's
+ * `flags=0x2(adhoc)` — so both count. `TeamIdentifier=not set` is codesign
+ * saying "none", not a team named "not". Returns null when the bundle carries
+ * no signature at all, which codesign reports on stderr with a non-zero exit.
+ */
+export function parseSigning(codesignOutput: string): SigningInfo | null {
+  const adhoc =
+    /^Signature=adhoc$/m.test(codesignOutput) || /flags=\S*\(adhoc[,)]/.test(codesignOutput);
+  const match = codesignOutput.match(/^TeamIdentifier=(.+)$/m);
+  const raw = match?.[1].trim();
+  const teamId = raw && raw !== "not set" ? raw : null;
+  // Nothing that looks like a signature block at all → unsigned or unreadable.
+  if (!adhoc && !teamId && !/^Signature size=/m.test(codesignOutput)) return null;
+  return { adhoc, teamId };
+}
+
+/**
+ * Decide whether the artifact matches the request. Pure: no IO, no printing, so
+ * the decision is testable without a signed bundle on disk.
+ */
+export function signingVerdict(info: SigningInfo | null, want: SigningExpectation): SigningVerdict {
+  if (!info) {
+    return want.wantsTeam
+      ? { ok: false, level: "fail",
+          message: "The installed extension carries no signature at all — Safari will not load it." }
+      : { ok: true, level: "warn",
+          message: "Could not read the installed extension's signature." };
+  }
+  if (!want.wantsTeam) {
+    return {
+      ok: true,
+      level: "ok",
+      message: info.adhoc
+        ? 'Ad-hoc signed, as asked — Safari drops it whenever it quits (keep "Allow Unsigned Extensions" on, or re-run with --team).'
+        : `Signed with team ${info.teamId}.`,
+    };
+  }
+  if (info.adhoc || !info.teamId) {
+    return {
+      ok: false,
+      level: "fail",
+      message:
+        "Team signing was requested but the installed extension is ad-hoc — Safari disables it every time it quits. " +
+        "No Apple team reached the build: sign in to Xcode (Settings → Accounts), or install an Apple Development certificate, then re-run.",
+    };
+  }
+  if (want.teamId && info.teamId !== want.teamId) {
+    return {
+      ok: false,
+      level: "fail",
+      message: `Installed extension is signed with team ${info.teamId}, not the requested ${want.teamId}.`,
+    };
+  }
+  return { ok: true, level: "ok", message: `Team-signed (${info.teamId}) — survives Safari quitting.` };
+}
+
+/** The bundle Safari actually loads: the .appex inside the built app. */
+export function extensionBundlePath(appPath: string): string {
+  const plugins = join(appPath, "Contents", "PlugIns");
+  if (existsSync(plugins)) {
+    const appex = readdirSync(plugins).find((name) => name.endsWith(".appex"));
+    if (appex) return join(plugins, appex);
+  }
+  return appPath;
+}
+
+/**
+ * Hold the installed artifact to what the run asked for. Team detection only
+ * predicts how the build will be signed; this reads the signature back off the
+ * bundle Safari loads, so a fallback anywhere in the chain — no certificate, a
+ * stale copy of this tool, xcodebuild quietly dropping the identity — surfaces
+ * as a failed `--verify` instead of an extension that disappears on the next
+ * Safari restart.
+ */
+export function verifySigning(appPath: string, want: SigningExpectation): boolean {
+  const target = extensionBundlePath(appPath);
+  // codesign writes its report to stderr; stdout stays empty.
+  const res = run("codesign", ["-dvv", target]);
+  const verdict = signingVerdict(parseSigning(res.stderr + res.stdout), want);
+  if (verdict.level === "ok") ok(verdict.message);
+  else if (verdict.level === "warn") warn(verdict.message);
+  else fail(verdict.message);
+  return verdict.ok;
 }
