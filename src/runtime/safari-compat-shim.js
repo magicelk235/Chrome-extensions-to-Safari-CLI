@@ -425,31 +425,51 @@ var __C2S_DEBUG__ = false;
   // compare getURL's output against both of those:
   //   uBlock: sender.origin === getURL("").slice(0, -1)   // lowercase on the left
   //   Honey:  location.href.includes(getURL("/"))         // UPPERCASE on the left
-  // getURL can only return one case. This used to lowercase the host for the empty/root
-  // arg and keep Safari's real case for resource paths, which satisfied uBlock and broke
-  // Honey: inPopover() went false, so its popup treated its own href as the current page
-  // URL, sent every message without a tabId, and the background rejected all of them →
-  // blank popup. Resource paths can't be lowercased either — Safari's resource server is
-  // CASE-SENSITIVE on the UUID host (live-proven on Grammarly), so a lowercased
-  // fetch(getURL("manifest.json")) 404s with "TypeError: Load failed" and the bg init
-  // stalls.
+  // getURL can only return one case per arg, and the two idioms want opposite cases: the
+  // origin comparison (getURL("")) wants lowercase to match Safari's lowercase origins, the
+  // href comparison (getURL("/…")) wants Safari's real UPPERCASE. An earlier fix lowercased
+  // the empty AND the root arg, which broke Honey: getURL("/") went lowercase, inPopover()
+  // went false, and its popup sent every message without a tabId → blank popup. Resource
+  // paths can't be lowercased either — Safari's resource server is CASE-SENSITIVE on the
+  // UUID host (live-proven on Grammarly), so a lowercased fetch(getURL("manifest.json"))
+  // 404s with "TypeError: Load failed" and bg init stalls.
   //
-  // So getURL returns Safari's real case for EVERY arg, and the odd one out —
-  // sender.origin — is aligned to it in senderWithFixedUrl, which hands the listener a
-  // clone. The live sender is an exotic getter whose mutation doesn't stick; a clone's
-  // does.
+  // The split in patchGetURL below resolves it: lowercase the host ONLY for the exactly-
+  // empty arg (the one every origin comparison uses), and keep Safari's real case for "/"
+  // and every resource path. sender.origin is then already lowercase and equal on both
+  // sides, so the senderWithFixedUrl alignment becomes a Safari no-op (it still helps
+  // browsers where the sender is mutable).
   function patchGetURL(rt) {
     if (!rt || typeof rt.getURL !== "function" || rt.__c2sGetURL) return;
     var orig = rt.getURL.bind(rt);
     var base = "";
     try { base = orig("/") || orig("manifest.json").replace(/manifest\.json[^/]*$/, "") || ""; } catch (e) {}
     if (!base) { try { base = (location && location.origin ? location.origin + "/" : ""); } catch (e) {} }
+    // Safari serves getURL()'s UUID host in UPPERCASE, but every origin — sender.origin,
+    // location.origin, and new URL(url).origin — is lowercase (the URL parser lowercases
+    // the host, and Safari reports sender.origin lowercase too). Bundles gate their own
+    // pages on that origin against getURL(""): uBlock does
+    // `sender.origin === getURL("").slice(0,-1)`, and LastPass's background accepts a
+    // message only when `new URL(sender.url).origin === sender.origin`. With getURL("")
+    // uppercase, uBlock's port sender (which Safari won't let us rewrite) never matches,
+    // and the message-sender clone we DO rewrite gets pushed up to uppercase, breaking
+    // LastPass. So lowercase the host for the EMPTY arg only — the one every origin
+    // comparison uses — and keep Safari's real case for "/" and resource paths: Honey
+    // matches location.href against getURL("/…"), and the resource server is case-sensitive
+    // on the host, so a lowercased fetch 404s. Tradeoff: a bundle doing
+    // sender.url.startsWith(getURL("")) now compares upper against lower, but that idiom is
+    // rare and the origin-equality one fixed here is the common gate.
+    function lowerHost(u) {
+      return String(u).replace(/^[^/]*\/\/[^/]+/, function (m) { return m.toLowerCase(); });
+    }
     function wrapped(p) {
+      var empty = (p == null || p === "");
       var r = null;
-      try { r = orig(p == null ? "" : p); } catch (e) {}
-      if (r) return r;
+      try { r = orig(empty ? "" : p); } catch (e) {}
+      if (r) return empty ? lowerHost(r) : r;
       // Safari gave us nothing usable (only the empty/root arg does that): build from base.
-      return base + (p == null ? "" : String(p)).replace(/^\.?\//, "");
+      var built = base + (empty ? "" : String(p).replace(/^\.?\//, ""));
+      return empty ? lowerHost(built) : built;
     }
     try { rt.getURL = wrapped; rt.__c2sGetURL = true; } catch (e) {
       try { Object.defineProperty(rt, "getURL", { value: wrapped, writable: true, configurable: true }); rt.__c2sGetURL = true; } catch (e2) {}
@@ -465,8 +485,8 @@ var __C2S_DEBUG__ = false;
   // the popup port is judged "unknown", never stored, and the bg posts no reply → the
   // popup's getPageConfig RPC never resolves → "Grammarly is starting…" hangs forever.
   // Restore Chrome's invariant: override runtime.id to the UUID taken from getURL("")'s
-  // host (lowercased — patchGetURL already lowercases the root-arg host, and the companion
-  // wrapOnConnect fix lowercases sender.url's host, so both sides of the regex agree).
+  // host (lowercased — patchGetURL lowercases the empty-arg host, so the UUID derived here
+  // matches the lowercase host that new URL() and sender.origin expose).
   // No-op if the host can't be derived; never throws.
   // A FROZEN Safari chrome.runtime blocks the getURL wrap (assignment + defineProperty
   // both fail on a frozen object), so getURL("") keeps returning ""/undefined and
@@ -740,11 +760,11 @@ var __C2S_DEBUG__ = false;
     // Compare case-insensitively: Safari hands out the UUID host in different cases per
     // API, which is the very thing being normalized here.
     if (bare.toLowerCase().indexOf(canon.toLowerCase()) !== 0) return sender;
-    // Safari reports sender.origin with a LOWERCASE UUID host while getURL() uses the
-    // real (upper) case, so a bundle gating its own pages with
+    // Safari reports sender.origin with a LOWERCASE UUID host, and getURL("") is lowercased
+    // for the empty arg above, so a bundle gating its own pages with
     //   sender.origin === getURL("").slice(0, -1)          // uBlock, verbatim
-    // never matches and the popup is judged unprivileged → getPopupData goes unanswered
-    // → blank popup. Align it to getURL's case.
+    // already matches on Safari with no rewrite. This alignment is for browsers where the
+    // sender is mutable and the cases still differ; on Safari it's a no-op.
     var origin;
     try { origin = sender.origin; } catch (e) {}
     var fixOrigin = typeof origin === "string" && origin !== canon &&
