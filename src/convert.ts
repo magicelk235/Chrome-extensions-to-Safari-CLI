@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -164,6 +164,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // keyboard-command page opens).
     const selfPaged = rewriteSelfPageExtensionUrls(stageDir);
     if (selfPaged > 0) ok(`Rewrote self-page chrome-extension: URLs to runtime.getURL in ${selfPaged} script(s)`);
+
+    // The scheme rewrite skips concrete-host URLs, which sweeps up
+    // chrome-extension://__MSG_@@extension_id__/… — the placeholder form a bundle uses
+    // to reach its own files from CSS. Safari fills in the UUID and keeps the scheme,
+    // so the request is blocked as insecure content (Cloaked: every webfont in
+    // content.css, on every page it injects into).
+    const placeholderUrls = rewriteExtensionIdPlaceholderUrls(stageDir);
+    if (placeholderUrls > 0) ok(`Rewrote @@extension_id placeholder URLs in ${placeholderUrls} file(s)`);
 
     // The worker→background-page conversion gives the background a `window`, so bundles
     // that identify the background by its ABSENCE decide they are a content script and

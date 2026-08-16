@@ -179,7 +179,7 @@ export function guardLocaleTailMessage(stageDir: string): number {
   return modified;
 }
 
-export function walkScripts(dir: string, acc: string[] = []): string[] {
+export function walkScripts(dir: string, acc: string[] = [], exts: string[] = [".js", ".mjs"]): string[] {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -189,8 +189,8 @@ export function walkScripts(dir: string, acc: string[] = []): string[] {
   for (const entry of entries) {
     if (entry.name === "node_modules" || entry.name.startsWith("__MACOSX")) continue;
     const full = join(dir, entry.name);
-    if (entry.isDirectory()) walkScripts(full, acc);
-    else if (entry.isFile() && (entry.name.endsWith(".js") || entry.name.endsWith(".mjs"))) acc.push(full);
+    if (entry.isDirectory()) walkScripts(full, acc, exts);
+    else if (entry.isFile() && exts.some((e) => entry.name.toLowerCase().endsWith(e))) acc.push(full);
   }
   return acc;
 }
@@ -321,6 +321,38 @@ export function rewriteChromeSchemeLiterals(stageDir: string): number {
     if (!CHROME_SCHEME_RE.test(content)) continue;
     CHROME_SCHEME_RE.lastIndex = 0;
     writeFileSync(file, content.replace(CHROME_SCHEME_RE, "safari-web-extension:"), "utf-8");
+    modified++;
+  }
+  return modified;
+}
+
+// `chrome-extension://__MSG_@@extension_id__/…` is how a bundle points at its own
+// files from CSS (and from markup), because the browser resolves @@extension_id at
+// load time. Safari DOES substitute the placeholder — with the per-install UUID —
+// but leaves the scheme alone, so the request goes out as
+// chrome-extension://<uuid>/… from an https page and WebKit blocks every one:
+// "requested insecure content … must be served over HTTPS". Live: Cloaked's
+// content.css, 18 blocked webfonts on each injection into my.cloaked.com, which is
+// also what buried its console.
+//
+// CHROME_SCHEME_RE skips this (its host guard can't tell a placeholder from a real
+// id), and it has to: a concrete-host URL may be an OAuth redirect_uri registered
+// with the provider. A placeholder host never is — nothing outside the browser can
+// resolve it — so the scheme is safe to fix here. Covers CSS, which the script-only
+// rewrites never see.
+const EXT_ID_PLACEHOLDER_RE = /chrome-extension:(?=\/\/__MSG_@@extension_id__\b)/g;
+
+export function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir, [], [".js", ".mjs", ".css", ".html", ".htm"])) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!content.includes("chrome-extension://__MSG_@@extension_id__")) continue;
+    writeFileSync(file, content.replace(EXT_ID_PLACEHOLDER_RE, "safari-web-extension:"), "utf-8");
     modified++;
   }
   return modified;
