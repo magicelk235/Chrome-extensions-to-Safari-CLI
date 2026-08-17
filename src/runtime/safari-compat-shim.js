@@ -2778,6 +2778,176 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
   }
 
+  // ── navigator.serviceWorker in an extension page → the converted background ──
+  // Chrome registers an MV3 background service worker against the extension origin,
+  // so an extension PAGE reaches the background through navigator.serviceWorker.
+  // The documented way to open a binary channel between a web page and a background
+  // SW is to embed an extension-origin iframe, hand it a MessagePort with
+  // window.postMessage, and forward that port on with
+  //   (await navigator.serviceWorker.ready).active.postMessage(msg, [port])
+  // Kondo's web app (app.trykondo.com ↔ ext.html) is exactly this shape, and it is
+  // the extension's ONLY channel: every request the app makes rides that port.
+  //
+  // viaduct turns the SW into a background PAGE, so the extension origin has no
+  // service-worker registration at all. Measured in a converted extension page:
+  // getRegistrations() → [], controller null, and `ready` stays pending forever — so
+  // the await never returns, nothing throws, and the bridge is silently dead.
+  //
+  // Emulate the surface here and tunnel the traffic over a runtime.connect port.
+  // That is the only transport available: an extension page embedded in a web page
+  // runs in the web content process, where extension.getBackgroundPage() is null
+  // (measured: still null after 11s with a port held open), so the port object
+  // cannot simply be handed to the background realm the way the offscreen emulation
+  // above does it. A MessagePort can't cross a runtime port either, so each
+  // transferred port is bridged: its messages travel as ordinary port messages, and
+  // the background side re-materializes a REAL MessagePort from a MessageChannel it
+  // owns, so `event.ports[0]` behaves like the port Chrome would have delivered.
+  // Payloads therefore cross as runtime-message JSON rather than a structured clone —
+  // no Blob/ArrayBuffer/Date fidelity.
+  (function () {
+    var proto = "";
+    try { proto = (typeof location !== "undefined" && location.protocol) || ""; } catch (e) {}
+    // Extension pages only. A content script's navigator.serviceWorker belongs to the
+    // web page and must keep its real registration.
+    if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(proto)) return;
+    var rt = null;
+    try { rt = (typeof chrome !== "undefined" && chrome.runtime) || (typeof browser !== "undefined" && browser.runtime) || null; } catch (e) {}
+    if (!rt) return;
+    var CHANNEL = "__c2sSwBridge";
+    var isBgPage = /background\.html$/.test((typeof location !== "undefined" && location.pathname) || "");
+
+    if (isBgPage) {
+      // Background side: replay each tunneled postMessage as a `message` event on
+      // self, the shape a real service worker receives.
+      if (!rt.onConnect || typeof rt.onConnect.addListener !== "function") return;
+      rt.onConnect.addListener(function (port) {
+        if (!port || port.name !== CHANNEL) return;
+        var bridged = {};   // pid → our end of the re-materialized MessagePort pair
+        var lastSeq = 0;    // the connect proxy can replay a queued send; ports are ordered
+        var client = {
+          // A real ExtendableMessageEvent carries the sending client and SW code
+          // answers on it (event.source.postMessage). Route that back to the page,
+          // which dispatches it on its navigator.serviceWorker.
+          postMessage: function (data) { try { port.postMessage({ t: "client", data: data }); } catch (e) {} },
+        };
+        port.onMessage.addListener(function (m) {
+          if (!m) return;
+          if (m.t === "port") {
+            var b = bridged[m.pid];
+            if (b) { try { b.postMessage(m.data); } catch (e) {} }
+            return;
+          }
+          if (m.t !== "msg" || !(m.seq > lastSeq)) return;
+          lastSeq = m.seq;
+          var pids = m.pids || [];
+          var ports = [];
+          for (var i = 0; i < pids.length; i++) {
+            var ch;
+            try { ch = new MessageChannel(); } catch (e) { continue; }
+            bridged[pids[i]] = ch.port1;
+            ch.port1.onmessage = (function (id) {
+              return function (ev) { try { port.postMessage({ t: "port", pid: id, data: ev.data }); } catch (e) {} };
+            })(pids[i]);
+            ports.push(ch.port2);
+          }
+          var ev;
+          try { ev = new MessageEvent("message", { data: m.data, origin: m.origin || "", ports: ports }); } catch (e) { return; }
+          // `source` and `waitUntil` are not MessageEvent members, so they go on as own
+          // properties; a handler that reads either must not throw.
+          try { Object.defineProperty(ev, "source", { value: client, configurable: true }); } catch (e) {}
+          try { ev.waitUntil = function () {}; } catch (e) {}
+          try { self.dispatchEvent(ev); } catch (e) {}
+        });
+        port.onDisconnect.addListener(function () {
+          for (var pid in bridged) { try { bridged[pid].close(); } catch (e) {} }
+          bridged = {};
+        });
+      });
+      return;
+    }
+
+    var container = null;
+    try { container = (typeof navigator !== "undefined") && navigator.serviceWorker; } catch (e) {}
+    if (!container) return;
+    // A live controller means this origin really does run a worker — leave it alone.
+    try { if (container.controller) return; } catch (e) {}
+
+    var tunnel = null, seq = 0, pidN = 0;
+    var mine = {};  // pid → the page-side MessagePort the caller transferred
+    function chan() {
+      if (tunnel) return tunnel;
+      var t = rt.connect({ name: CHANNEL });
+      tunnel = t;
+      t.onMessage.addListener(function (m) {
+        if (!m) return;
+        if (m.t === "port") {
+          var p = mine[m.pid];
+          if (p) { try { p.postMessage(m.data); } catch (e) {} }
+        } else if (m.t === "client") {
+          try { container.dispatchEvent(new MessageEvent("message", { data: m.data })); } catch (e) {}
+        }
+      });
+      // Reconnect on the next send: the wrapped connect() wakes a suspended
+      // background, so a dropped tunnel is recoverable rather than fatal.
+      t.onDisconnect.addListener(function () { if (tunnel === t) tunnel = null; });
+      return t;
+    }
+    var worker = {
+      state: "activated",
+      scriptURL: (function () { try { return rt.getURL ? rt.getURL("/background.html") : ""; } catch (e) { return ""; } })(),
+      onstatechange: null,
+      addEventListener: function () {}, removeEventListener: function () {},
+      postMessage: function (data, transfer) {
+        var list = [];
+        if (transfer && transfer.length) list = transfer;
+        else if (transfer && transfer.transfer && transfer.transfer.length) list = transfer.transfer; // postMessage(data, {transfer})
+        var pids = [];
+        for (var i = 0; i < list.length; i++) {
+          var p = list[i];
+          // Only MessagePorts need bridging; anything else rides along inside `data`.
+          if (!p || typeof p.postMessage !== "function" || typeof p.close !== "function") continue;
+          var pid = "p" + (++pidN);
+          mine[pid] = p;
+          p.onmessage = (function (id) {
+            return function (ev) {
+              try { chan().postMessage({ t: "port", pid: id, data: ev.data }); } catch (e) {}
+            };
+          })(pid);
+          pids.push(pid);
+        }
+        var o = "";
+        try { o = (typeof location !== "undefined" && location.origin) || ""; } catch (e) {}
+        try { chan().postMessage({ t: "msg", seq: ++seq, data: data, pids: pids, origin: o }); } catch (e) {}
+      },
+    };
+    var reg = {
+      scope: (function () { try { return rt.getURL ? rt.getURL("/") : "/"; } catch (e) { return "/"; } })(),
+      active: worker, installing: null, waiting: null, updateViaCache: "imports",
+      addEventListener: function () {}, removeEventListener: function () {},
+      update: function () { return Promise.resolve(reg); },
+      unregister: function () { return Promise.resolve(true); },
+      showNotification: function () { return Promise.resolve(); },
+      getNotifications: function () { return Promise.resolve([]); },
+    };
+    // Chrome resolves `ready` as soon as the worker is active, which for a converted
+    // background page is always: a postMessage buffers behind connect() while the page
+    // wakes, so resolving now can't lose a send.
+    var patch = {
+      ready: Promise.resolve(reg), controller: worker,
+      register: function () { return Promise.resolve(reg); },
+      getRegistration: function () { return Promise.resolve(reg); },
+      getRegistrations: function () { return Promise.resolve([reg]); },
+      startMessages: function () {},
+    };
+    // Patch the native container in place so object identity survives (the offscreen
+    // emulation above dispatches on w.navigator.serviceWorker) and addEventListener /
+    // onmessage stay the platform's. Per property, so one frozen slot can't cost the
+    // rest — `ready` is the one that matters.
+    for (var k in patch) {
+      try { Object.defineProperty(container, k, { value: patch[k], writable: true, configurable: true }); } catch (e) {}
+    }
+  })();
+
   // Namespaces with NO Safari equivalent that Chrome extensions still reference at
   // module-eval (reading <ns>.<event>.addListener or an enum) throw a TypeError that
   // aborts SW/page evaluation and blanks the surface — same failure class as
