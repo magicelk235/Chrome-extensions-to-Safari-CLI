@@ -4550,6 +4550,74 @@ var __C2S_DEBUG__ = false;
       }
     } catch (e) {}
 
+    // cookies.get must return the cookie the REQUEST will carry. When two cookies
+    // share a name on nested domains, Safari answers with the wrong one: LinkedIn's
+    // real JSESSIONID lives on `.www.linkedin.com`, Kondo mints a fallback one on
+    // `.linkedin.com` whenever it can't find a session, and from then on
+    // cookies.get({name:"JSESSIONID", url:"https://www.linkedin.com/"}) hands back the
+    // APEX cookie while the network stack sends the host one first. Every request then
+    // carries a Csrf-Token that contradicts its own Cookie header, LinkedIn answers 403
+    // "CSRF check failed", and it never recovers on its own — the junk cookie outlives
+    // the session that caused it.
+    //
+    // Chrome breaks the tie by longest path, then earliest creation, which returns the
+    // site's own cookie. Safari exposes no creation time, so order candidates the way
+    // the server sees them (RFC 6265: longest path first, then the most specific
+    // domain), which keeps a read agreeing with the request that follows it. Only
+    // engaged when getAll reports MORE THAN ONE candidate — a single match, or a
+    // getAll that can't answer, falls straight through to the native get.
+    try {
+      var __ckGet = chrome.cookies.get, __ckGetAll = chrome.cookies.getAll;
+      if (typeof __ckGet === "function" && typeof __ckGetAll === "function" && !chrome.cookies.__c2sGetOrder) {
+        // [path length, exact-host match, domain length] — compared left to right.
+        var __ckRank = function (c, host) {
+          var d = String((c && c.domain) || "").replace(/^\./, "").toLowerCase();
+          return [String((c && c.path) || "").length, d && d === host ? 1 : 0, d.length];
+        };
+        var __ckBetter = function (a, b) {
+          for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return a[i] > b[i]; }
+          return false;
+        };
+        var __ckPick = function (list, url) {
+          var host = "";
+          try { host = new URL(url).hostname.toLowerCase(); } catch (e) {}
+          var best = null, bestRank = null;
+          for (var i = 0; i < list.length; i++) {
+            var r = __ckRank(list[i], host);
+            if (!bestRank || __ckBetter(r, bestRank)) { best = list[i]; bestRank = r; }
+          }
+          return best;
+        };
+        var __ckTook = installOverride(chrome.cookies, "get", function (details, cb) {
+          var ns = this;
+          var native = function () {
+            var r;
+            try { r = __ckGet.call(ns, details, typeof cb === "function" ? cb : undefined); } catch (e) { return dual(null, cb); }
+            if (typeof cb === "function") return undefined;
+            return (r && typeof r.then === "function") ? r : Promise.resolve(r);
+          };
+          var url = details && details.url, name = details && details.name;
+          if (!url || !name) return native();
+          var all;
+          try { all = __ckGetAll.call(ns, { url: url, name: name }); } catch (e) { return native(); }
+          if (!all || typeof all.then !== "function") return native(); // callback-only host → leave it alone
+          var picked = all.then(function (list) {
+            if (!list || list.length < 2) return null;      // nothing to disambiguate
+            return __ckPick(list, url);
+          }, function () { return null; });
+          if (typeof cb === "function") {
+            picked.then(function (c) {
+              if (c) { setLastErr(null); try { cb(c); } catch (e) {} return; }
+              try { __ckGet.call(ns, details, cb); } catch (e) { try { cb(null); } catch (e2) {} }
+            });
+            return undefined;
+          }
+          return picked.then(function (c) { return c || native(); });
+        });
+        if (__ckTook) { try { chrome.cookies.__c2sGetOrder = true; } catch (e) {} }
+      }
+    } catch (e) {}
+
     // chrome.permissions — Safari grants every manifest-declared permission/host up
     // front (there is no runtime grant/revoke), so answer TRUTHFULLY from the manifest
     // instead of a blanket "not granted". A hardcoded contains()→false makes the very
