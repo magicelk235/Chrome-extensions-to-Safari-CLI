@@ -1,6 +1,6 @@
-import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readdirSync, existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, basename } from "node:path";
 import { run, info, warn } from "../util.js";
 import type { Platforms } from "../types.js";
@@ -1004,23 +1004,89 @@ export function unsignedExtensionsAllowed(): boolean | null {
   return res.stdout.trim() === "1";
 }
 
+/** A real Apple team id is exactly 10 alphanumerics; anchor so a longer token
+ *  never gets truncated into a wrong-but-plausible id. */
+const TEAM_ID = "([A-Z0-9]{10})(?![A-Z0-9])";
+
 /**
  * Best-effort read of an Apple Developer Team ID, so the tool can team-sign
- * without the user knowing or passing the id. Two sources, tried in order: the
- * team Xcode caches under IDEProvisioningTeamByIdentifier in com.apple.dt.Xcode
- * (keyed by Apple ID), then the codesigning identity in the keychain. Returns
- * the first 10-char team id it can parse, and null only when neither source
- * yields one.
+ * without the user knowing or passing the id. The team id is all the build
+ * needs: xcodebuild runs with -allowProvisioningUpdates, so Xcode mints the
+ * development certificate and profile on demand. Sources, tried in order:
+ * Xcode's cached team list, xcodebuild's copy of it, any provisioning profile
+ * already on disk, then the codesigning identity in the keychain. Returns null
+ * only when none of them yields one.
  */
 export function detectXcodeTeam(): string | null {
-  const res = run("defaults", ["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"]);
-  if (res.code === 0) {
-    // Boundary after the 10 chars so an over-long token isn't truncated into a
-    // wrong 10-char id; a real Apple team id is exactly 10 alphanumerics.
-    const ids = [...res.stdout.matchAll(/teamID\s*=\s*"?([A-Z0-9]{10})(?![A-Z0-9])"?/g)].map((m) => m[1]);
-    if (ids[0]) return ids[0];
+  return teamFromPrefs() ?? teamFromProvisioningProfiles() ?? teamFromKeychain();
+}
+
+/**
+ * Team ids Xcode caches after an account is added. Two domains and two keys:
+ * Xcode writes IDEProvisioningTeamByIdentifier (keyed by Apple ID account uuid),
+ * older versions and xcodebuild itself write IDEProvisioningTeams, and the
+ * xcodebuild domain is sometimes populated when the Xcode one is not. Reading
+ * all four costs four cheap `defaults` calls and covers machines where only one
+ * of them was ever written.
+ */
+function teamFromPrefs(): string | null {
+  for (const domain of ["com.apple.dt.Xcode", "com.apple.dt.xcodebuild"]) {
+    for (const key of ["IDEProvisioningTeamByIdentifier", "IDEProvisioningTeams"]) {
+      const res = run("defaults", ["read", domain, key]);
+      if (res.code !== 0) continue;
+      const id = res.stdout.match(new RegExp(`teamID\\s*=\\s*"?${TEAM_ID}"?`))?.[1];
+      if (id) return id;
+    }
   }
-  return teamFromKeychain();
+  return null;
+}
+
+/** Where Xcode keeps provisioning profiles it has downloaded, macOS then iOS. */
+const PROFILE_DIRS = [
+  join(homedir(), "Library", "Developer", "Xcode", "UserData", "Provisioning Profiles"),
+  join(homedir(), "Library", "MobileDevice", "Provisioning Profiles"),
+];
+
+/**
+ * Team id off a provisioning profile. Profiles are CMS-signed but the payload
+ * plist sits in the blob as plain XML, so a scan beats shelling out to
+ * `security cms -D` once per file. Newest profile wins — it reflects the team
+ * the user most recently provisioned for.
+ */
+function teamFromProvisioningProfiles(): string | null {
+  const profiles: { path: string; mtime: number }[] = [];
+  for (const dir of PROFILE_DIRS) {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith(".provisionprofile") && !entry.name.endsWith(".mobileprovision")) continue;
+      const full = join(dir, entry.name);
+      try {
+        profiles.push({ path: full, mtime: statSync(full).mtimeMs });
+      } catch {}
+    }
+  }
+  profiles.sort((a, b) => b.mtime - a.mtime);
+  for (const profile of profiles) {
+    let xml;
+    try {
+      // latin1: the CMS wrapper is binary, and decoding it as utf-8 would mangle
+      // bytes around the plist. The plist itself is ASCII either way.
+      xml = readFileSync(profile.path, "latin1");
+    } catch {
+      continue;
+    }
+    const id = xml.match(
+      new RegExp(`<key>(?:TeamIdentifier|com\\.apple\\.developer\\.team-identifier)</key>\\s*(?:<array>\\s*)?<string>${TEAM_ID}</string>`),
+    )?.[1];
+    if (id) return id;
+  }
+  return null;
 }
 
 /** Cert prefixes Xcode issues for development signing, best first. */
@@ -1032,12 +1098,9 @@ const SIGNING_CERT_PREFIXES = [
 ];
 
 /**
- * Team ID read off the signing certificate itself, used when Xcode's preference
- * cache comes up empty. That cache is written asynchronously and stays missing
- * on real setups where the account is added but no team has been fetched yet, so
- * an account that can sign perfectly well reads as "not signed in". The
- * certificate is the better source: it is what codesign consumes, and Apple puts
- * the team id in the subject's OU.
+ * Team ID read off the signing certificate itself, used when nothing Xcode
+ * wrote to disk yields one. The certificate is the most authoritative source:
+ * it is what codesign consumes, and Apple puts the team id in the subject's OU.
  */
 function teamFromKeychain(): string | null {
   const list = run("security", ["find-identity", "-v", "-p", "codesigning"]);
@@ -1056,7 +1119,7 @@ function teamFromKeychain(): string | null {
     if (pem.code !== 0 || !pem.stdout.includes("BEGIN CERTIFICATE")) continue;
     const subject = run("openssl", ["x509", "-noout", "-subject"], { input: pem.stdout });
     if (subject.code !== 0) continue;
-    const ou = subject.stdout.match(/OU\s*=\s*([A-Z0-9]{10})(?![A-Z0-9])/);
+    const ou = subject.stdout.match(new RegExp(`OU\\s*=\\s*${TEAM_ID}`));
     if (ou) return ou[1];
   }
   return null;
