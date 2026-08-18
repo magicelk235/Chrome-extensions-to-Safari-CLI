@@ -130,6 +130,26 @@ test("signingVerdict: ad-hoc is fine when no team was asked for", () => {
   assert.equal(v.ok, true);
 });
 
+test("signingVerdict: an announced ad-hoc fallback is not a failure", () => {
+  // --team auto with no team on the machine: the run already warned it was
+  // falling back, so the predicted ad-hoc bundle must not exit 1 (issue #14).
+  const v = signingVerdict(parseSigning(ADHOC), { wantsTeam: false, fellBack: true });
+  assert.equal(v.ok, true);
+  assert.equal(v.level, "warn");
+  assert.match(v.message, /--team/);
+});
+
+test("signingVerdict: a fallback run still fails on an unsigned bundle", () => {
+  // The fallback promises ad-hoc signing, not the absence of a signature.
+  assert.equal(signingVerdict(null, { wantsTeam: false, fellBack: true }).ok, false);
+});
+
+test("signingVerdict: a fallback run that somehow team-signed still passes", () => {
+  const v = signingVerdict(parseSigning(TEAM_SIGNED), { wantsTeam: false, fellBack: true });
+  assert.equal(v.ok, true);
+  assert.equal(v.level, "ok");
+});
+
 test("signingVerdict: an unsigned bundle fails a team-signing request", () => {
   assert.equal(signingVerdict(null, { wantsTeam: true }).ok, false);
 });

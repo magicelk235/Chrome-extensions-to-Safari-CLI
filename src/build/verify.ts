@@ -85,10 +85,13 @@ export interface SigningInfo {
 
 /** What the run asked signing to be, so the artifact can be held to it. */
 export interface SigningExpectation {
-  /** A team was asked for: `--team <id>`, `--team auto`, or plain `--install`. */
+  /** A concrete team reached the build, so the artifact must carry it. */
   wantsTeam: boolean;
-  /** The team detection resolved; absent when it found none. */
+  /** The team the build was told to use; absent when detection found none. */
   teamId?: string;
+  /** A team was asked for (`--team auto` / plain `--install`) but none was
+   *  found, so the run announced an ad-hoc fallback and ad-hoc is expected. */
+  fellBack?: boolean;
 }
 
 export interface SigningVerdict {
@@ -121,28 +124,43 @@ export function parseSigning(codesignOutput: string): SigningInfo | null {
  */
 export function signingVerdict(info: SigningInfo | null, want: SigningExpectation): SigningVerdict {
   if (!info) {
-    return want.wantsTeam
+    // An unsigned .appex never loads, whether or not a team was in play — the
+    // fallback promised ad-hoc signing, not no signature.
+    return want.wantsTeam || want.fellBack
       ? { ok: false, level: "fail",
           message: "The installed extension carries no signature at all — Safari will not load it." }
       : { ok: true, level: "warn",
           message: "Could not read the installed extension's signature." };
   }
   if (!want.wantsTeam) {
-    return {
-      ok: true,
-      level: "ok",
-      message: info.adhoc
-        ? 'Ad-hoc signed, as asked — Safari drops it whenever it quits (keep "Allow Unsigned Extensions" on, or re-run with --team).'
-        : `Signed with team ${info.teamId}.`,
-    };
+    if (!info.adhoc && info.teamId) {
+      return { ok: true, level: "ok", message: `Signed with team ${info.teamId}.` };
+    }
+    return want.fellBack
+      ? {
+          ok: true,
+          level: "warn",
+          message:
+            "Ad-hoc signed — no Apple team was found, so the run fell back as warned. Safari disables the " +
+            'extension every time it quits; keep Develop → "Allow Unsigned Extensions" ticked, or pass ' +
+            "--team <TEAMID> and re-run.",
+        }
+      : {
+          ok: true,
+          level: "ok",
+          message:
+            'Ad-hoc signed, as asked — Safari drops it whenever it quits (keep "Allow Unsigned Extensions" on, or re-run with --team).',
+        };
   }
   if (info.adhoc || !info.teamId) {
     return {
       ok: false,
       level: "fail",
       message:
-        "Team signing was requested but the installed extension is ad-hoc — Safari disables it every time it quits. " +
-        "No Apple team reached the build: sign in to Xcode (Settings → Accounts), or install an Apple Development certificate, then re-run.",
+        `Team ${want.teamId ?? "signing"} was requested and reached xcodebuild, but the installed extension is ` +
+        "ad-hoc — Safari disables it every time it quits. The build dropped the identity: check that an " +
+        '"Apple Development" certificate for that team is in your keychain (Xcode → Settings → Accounts → ' +
+        "Manage Certificates → +), then re-run.",
     };
   }
   if (want.teamId && info.teamId !== want.teamId) {
