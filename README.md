@@ -320,22 +320,24 @@ viaduct ./my-extension.zip --install --team auto # same, explicit
 viaduct ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
 ```
 
-Auto-detection tries four sources in order: the team Xcode cached
-(`IDEProvisioningTeamByIdentifier` / `IDEProvisioningTeams`, in both the
+Auto-detection tries three kinds of source in order: the team Xcode cached
+(`IDEProvisioningTeamByIdentifier` or `IDEProvisioningTeams`, in both the
 `com.apple.dt.Xcode` and `com.apple.dt.xcodebuild` domains), any provisioning
-profile already on disk, then the codesigning identity in your keychain. The
-team id is all the build needs — xcodebuild runs with
-`-allowProvisioningUpdates`, so Xcode mints the development certificate itself.
-If nothing turns up a team, the run says so and falls back to ad-hoc signing.
+profile already on disk, then a codesigning identity in your keychain. Each one
+covers several layouts, since which preference key gets written, where profiles
+live, and what your certificate is called all vary by Xcode version. The team id
+is all the build needs: xcodebuild runs with `-allowProvisioningUpdates`, so
+Xcode mints the development certificate itself. If nothing turns up a team, the
+run says so and falls back to ad-hoc signing.
 
 Signing is not taken on trust. When a team does reach xcodebuild, the signature
 is read back off the built app and checked, so a build that quietly came out
 ad-hoc fails instead of handing you an extension that disappears the next time
-Safari quits. An announced ad-hoc fallback is a warning, not a failure — you
-asked for "a team if there is one", and there wasn't.
+Safari quits. An announced ad-hoc fallback is a warning rather than a failure,
+since you asked for "a team if there is one" and there wasn't one.
 
 A free personal Apple team works, but its provisioning profile expires about
-every 7 days — re-run the command to re-sign. A paid Developer Program account
+every 7 days, so re-run the command to re-sign. A paid Developer Program account
 lasts about a year.
 
 If you prefer to install manually, copy the printed app path yourself:

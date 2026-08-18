@@ -1081,20 +1081,33 @@ function teamFromProvisioningProfiles(): string | null {
     } catch {
       continue;
     }
+    // TeamIdentifier is the modern key; profiles cut before Xcode 6 carry only
+    // ApplicationIdentifierPrefix, whose single element is the same team id.
     const id = xml.match(
-      new RegExp(`<key>(?:TeamIdentifier|com\\.apple\\.developer\\.team-identifier)</key>\\s*(?:<array>\\s*)?<string>${TEAM_ID}</string>`),
+      new RegExp(
+        "<key>(?:TeamIdentifier|ApplicationIdentifierPrefix|com\\.apple\\.developer\\.team-identifier)</key>" +
+          `\\s*(?:<array>\\s*)?<string>${TEAM_ID}</string>`,
+      ),
     )?.[1];
     if (id) return id;
   }
   return null;
 }
 
-/** Cert prefixes Xcode issues for development signing, best first. */
+/**
+ * Cert prefixes that carry a team id in the subject OU, best first. The
+ * development ones come first because that is what the build asks for, but a
+ * paid account that only ever signed notarized releases has nothing but a
+ * `Developer ID` cert, and reading the team off that is still better than
+ * telling the user they have no Apple account.
+ */
 const SIGNING_CERT_PREFIXES = [
   "Apple Development",
   "Mac Developer",
   "Apple Distribution",
   "iPhone Developer",
+  "Developer ID Application",
+  "3rd Party Mac Developer Application",
 ];
 
 /**
