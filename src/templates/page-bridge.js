@@ -7,10 +7,12 @@
   if (window.__claudeBridgeInstalled) return;
   window.__claudeBridgeInstalled = true;
   // Verbose logging OFF by default (runs in the page's MAIN world). Set
-  // window.__C2S_DEBUG = true to re-enable diagnostic logs.
-  var DEBUG = !!window.__C2S_DEBUG;
-  var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
-  var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
+  // window.__C2S_DEBUG = true to re-enable diagnostic logs. Read at CALL time: this
+  // script runs at document_start, so a load-time read can never be turned on from a
+  // console, which is the only place anyone debugging a stuck page can reach.
+  var DEBUG = function () { try { return !!window.__C2S_DEBUG; } catch (e) { return false; } };
+  var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
+  var DBGW = function () { if (DEBUG()) try { console.warn.apply(console, arguments); } catch (e) {} };
   // The page reads chrome.runtime.id. For a faithful conversion this should be
   // the extension's original Chrome id; the converter substitutes it at build
   // time when known (CRX/store download). If left unsubstituted, fall back to
@@ -100,4 +102,26 @@
   else { ns.runtime.sendMessage = sendMessage; if (!ns.runtime.id) ns.runtime.id = CHROME_ID; }
   window.chrome = ns;
   DBG("[bridge] page chrome.runtime installed");
+  // Tell the isolated-world relay this world actually got the bridge. It cannot read
+  // `window.chrome` across worlds, and it must know: Safari runs a world:"MAIN"
+  // content script only from 18.4, and below that the entry is ignored in silence —
+  // no bridge in the page, so an externally_connectable page's
+  // `chrome.runtime.sendMessage` is undefined, it messages nobody, and its login
+  // button spins forever with nothing logged. Absent an answer the relay injects this
+  // same file as a web-accessible <script> instead.
+  //
+  // ANSWERABLE, not announce-once: the two content scripts are separate script
+  // evaluations, so an eager announcement can be posted before the relay has attached
+  // its listener and be missed. The relay would then inject a second copy, the
+  // install-once guard at the top would return before announcing anything, and the
+  // relay would report a page with no bridge while the bridge was sitting right there.
+  // Answering a probe is idempotent and works however this world got the file.
+  window.addEventListener("message", function (ev) {
+    if (ev.source !== window) return;
+    if (ev.origin !== window.location.origin) return;
+    if (!ev.data || ev.data.__claudeBridge !== "probe") return;
+    try { window.postMessage({ __claudeBridge: "ready" }, window.location.origin); } catch (e) {}
+  });
+  // Eager announcement too: when it does land it saves the relay a probe round trip.
+  try { window.postMessage({ __claudeBridge: "ready" }, window.location.origin); } catch (e) {}
 })();

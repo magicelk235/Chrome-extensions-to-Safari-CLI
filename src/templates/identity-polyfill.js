@@ -1,12 +1,20 @@
 // identity-polyfill.js — Safari chrome.identity shim for OAuth.
 // Verbose logging is OFF by default (it can leak OAuth tokens into the console).
-// Set self.__C2S_DEBUG = true before this loads to re-enable diagnostic logs.
+// Set self.__C2S_DEBUG = true to re-enable diagnostic logs. The flag is read at CALL
+// time, not at load: this file runs before the bundle, so a load-time read can only
+// ever be flipped by editing the build, and diagnosing a dead page->SW handshake
+// means turning logging on in a background console that is already running.
 (function () {
   "use strict";
-  var DEBUG = (typeof self !== "undefined" && self.__C2S_DEBUG) ||
-              (typeof globalThis !== "undefined" && globalThis.__C2S_DEBUG) || false;
-  var DBG = function () { if (DEBUG) try { console.log.apply(console, arguments); } catch (e) {} };
-  var DBGW = function () { if (DEBUG) try { console.warn.apply(console, arguments); } catch (e) {} };
+  var DEBUG = function () {
+    try {
+      if (typeof self !== "undefined" && self.__C2S_DEBUG) return true;
+      if (typeof globalThis !== "undefined" && globalThis.__C2S_DEBUG) return true;
+    } catch (e) {}
+    return false;
+  };
+  var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
+  var DBGW = function () { if (DEBUG()) try { console.warn.apply(console, arguments); } catch (e) {} };
   // Install-once: background.html loads this as a classic script (so the
   // onMessageExternal capture beats hoisted importScripts chunks) AND the SW
   // module imports it; the second evaluation must be a no-op or listeners
@@ -190,7 +198,64 @@
   // messages to the SW as internal messages tagged {__bridge:true}. Here we
   // capture the extension's onMessageExternal listeners and re-dispatch those
   // tagged messages to them, synthesizing sender.origin so origin checks pass.
-  function safeOrigin(u) { try { return new URL(u).origin; } catch (e) { return undefined; } }
+  // An opaque URL (about:blank, data:, a sandboxed frame) parses to the STRING "null".
+  // Returning that would hand an allow-list a plausible-looking origin that matches
+  // nothing and can never be diagnosed from the outside; treat it as no answer so the
+  // next source in the chain gets a turn.
+  function safeOrigin(u) {
+    try {
+      var o = new URL(u).origin;
+      return o && o !== "null" ? o : undefined;
+    } catch (e) { return undefined; }
+  }
+  /** URL without query/fragment — a tab's URL and the sender's must agree on the path. */
+  function samePage(u) { try { return String(u).split(/[?#]/)[0]; } catch (e) { return ""; } }
+  /**
+   * The tab a bridged page message came from. Matched by URL across all tabs, then the
+   * active tab of the last-focused window, then nothing. Never throws, and resolves
+   * within 1.5s whatever happens — a handler waiting on this must not be the reason a
+   * page hangs.
+   *
+   * The active-tab fallback exists because reading `tab.url` needs the tabs (or a host)
+   * permission: without it every tab comes back url-less and no match is possible. But
+   * it must never hand over a tab we can SEE belongs to another site — a handler acting
+   * on sender.tab.id navigates it (Claude's oauth_redirect does exactly that), and
+   * navigating a user's unrelated tab away is worse than supplying no tab at all. So the
+   * fallback is taken only when the candidate's origin matches, or when its URL is
+   * unreadable and therefore cannot be contradicted.
+   */
+  function findSenderTab(url, origin) {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var finish = function (t) { if (!settled) { settled = true; resolve(t); } };
+      setTimeout(function () { finish(undefined); }, 1500);
+      var tabs = api.tabs;
+      if (!tabs || typeof tabs.query !== "function") return finish(undefined);
+      var want = samePage(url);
+      var query = function (q, cb) {
+        try {
+          var r = tabs.query(q, function (list) { cb(list); });
+          if (r && typeof r.then === "function") r.then(cb, function () { cb(null); });
+        } catch (e) { cb(null); }
+      };
+      query({}, function (all) {
+        if (want && all && all.length) {
+          for (var i = 0; i < all.length; i++) {
+            if (all[i] && all[i].url && samePage(all[i].url) === want) return finish(all[i]);
+          }
+        }
+        query({ active: true, lastFocusedWindow: true }, function (act) {
+          var t = act && act.length ? act[0] : undefined;
+          if (!t) return finish(undefined);
+          if (!t.url) return finish(t);                       // unreadable → can't contradict
+          if (origin && safeOrigin(t.url) === origin) return finish(t);
+          DBG("[idpoly] active tab is a different origin than the sender — no tab supplied");
+          finish(undefined);
+        });
+      });
+    });
+  }
+
   var extListeners = [];
   // Capture the SW's onMessageExternal handler so bridged page messages can be
   // dispatched to it. Safari may expose onMessageExternal as a read-only/native
@@ -262,10 +327,32 @@
   })();
   if (api.runtime && api.runtime.onMessage) {
     api.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-      if (!msg || msg.__bridge !== true) return;
-      var origin = sender.origin || safeOrigin(sender.url) ||
-                   (sender.tab && sender.tab.url ? safeOrigin(sender.tab.url) : undefined);
+      if (!msg) return;
+      // The relay's wake handshake. Answered here, never forwarded to the
+      // extension's own listeners: it has to work for a bundle that knows nothing
+      // about a "ping", and the relay repeats it until it lands, so it must not
+      // reach anything with a side effect. A reply also proves more than that the
+      // background is awake — it proves THIS polyfill is installed and listening,
+      // which is the whole precondition for the bridge.
+      if (msg.__bridgePing === true) {
+        try { sendResponse({ ok: true }); } catch (e) {}
+        return Promise.resolve({ ok: true });
+      }
+      if (msg.__bridge !== true) return;
+      // The bridged message's real sender is the PAGE, and Chrome's external sender
+      // reports that page's own url/origin. The relay hands us a CONTENT SCRIPT
+      // sender instead, whose `origin` is whatever Safari chose to put there — not
+      // necessarily the page's (Safari has been observed reporting an extension
+      // origin on senders it builds itself). The page URL is the authoritative
+      // source, so derive from it first and keep sender.origin only as the last
+      // resort: an extension gating on `sender.origin === "https://site"` (Claude's
+      // oauth_redirect handler, verbatim) otherwise fails the gate, answers nothing,
+      // and leaves the page's Authorize button spinning with nothing logged.
+      var origin = safeOrigin(sender.url) ||
+                   (sender.tab && sender.tab.url ? safeOrigin(sender.tab.url) : undefined) ||
+                   sender.origin;
       var fixed = Object.assign({}, sender, { origin: origin });
+      var mtype = (msg.payload && msg.payload.type) || "(no type)";
       DBG("[idpoly] bridge msg", JSON.stringify(msg.payload), "origin", origin,
                   "listeners", extListeners.length);
       // Return a Promise so Safari/Firefox deliver the async response. Safari
@@ -285,18 +372,42 @@
           resp({ success: false, error: "bridge: no external listener captured" });
           return;
         }
-        // Chrome's channel contract: a listener keeps the channel open only by
-        // returning true (or a Promise). If none does, close it now — otherwise a
-        // fire-and-forget message leaves the page waiting out its 30s timeout.
-        var willRespond = false;
-        for (var i = 0; i < extListeners.length; i++) {
-          try {
-            var ret = extListeners[i](msg.payload, fixed, resp);
-            if (ret === true) willRespond = true;
-            else if (ret && typeof ret.then === "function") { willRespond = true; ret.then(resp, function () { resp(undefined); }); }
-          } catch (e) { console.error("[idpoly] extListener err", e); }
+        function dispatch(s) {
+          // Chrome's channel contract: a listener keeps the channel open only by
+          // returning true (or a Promise). If none does, close it now — otherwise a
+          // fire-and-forget message leaves the page waiting out its 30s timeout.
+          var willRespond = false;
+          for (var i = 0; i < extListeners.length; i++) {
+            try {
+              var ret = extListeners[i](msg.payload, s, resp);
+              if (ret === true) willRespond = true;
+              else if (ret && typeof ret.then === "function") { willRespond = true; ret.then(resp, function () { resp(undefined); }); }
+            } catch (e) { console.error("[idpoly] extListener err", e); }
+          }
+          if (!willRespond && !settled) { resp(undefined); return; }
+          // A listener held the channel open and never answered. Chrome only does that
+          // when its own gate rejected the message (an origin allow-list, usually), and
+          // the page then waits out the relay's timeout with no error anywhere. Name it
+          // once instead: which message, which origin the listeners were handed.
+          setTimeout(function () {
+            if (settled) return;
+            console.error("[idpoly] bridge msg '" + mtype + "' accepted by " + extListeners.length +
+                          " onMessageExternal listener(s) but none answered — sender.origin was '" +
+                          origin + "'. The extension's own origin check most likely rejected it.");
+          }, 5000);
         }
-        if (!willRespond && !settled) resp(undefined);
+        // Chrome always gives an external message from a page a sender.tab — the page
+        // IS in a tab — and handlers act on it: Claude's oauth_redirect finishes by
+        // navigating `sender.tab.id` to claude.ai/chrome/installed, which is what
+        // dismisses the consent window. The relay's storage-mailbox transport cannot
+        // supply one (a content script can't read its own tab id, and the shim's own
+        // selfSender has the same gap), so the handler saw `undefined`, skipped the
+        // navigation, and left a logged-in user staring at a spinner. Resolve it here
+        // from the page URL before dispatching.
+        if (fixed.tab && fixed.tab.id != null) { dispatch(fixed); return; }
+        findSenderTab(sender.url, origin).then(function (t) {
+          dispatch(t && t.id != null ? Object.assign({}, fixed, { tab: t }) : fixed);
+        });
       });
     });
   }
