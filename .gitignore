@@ -47,11 +47,14 @@ test extensions/
 # Editor / local MCP config
 .vscode/
 
-# Tests, per-extension reports, and project notes — kept local, not pushed
-test/
+# Per-extension reports and project notes: kept local, not pushed.
+# `test/` used to be listed here too, from back when the suite was local-only. It stopped
+# being local the moment CI started gating publishes on `npm test`: an ignored suite means
+# the gate runs whatever happens to be committed, which was 19 of 51 files.
 reports/
 docs/
 CLAUDE.md
+AGENTS.MD
 
 # GitHub wiki clone (its own repo, pushed separately)
 wiki/
