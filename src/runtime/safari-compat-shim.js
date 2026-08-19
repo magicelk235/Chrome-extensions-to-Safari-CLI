@@ -6703,6 +6703,106 @@ var __C2S_DEBUG__ = false;
     } catch (e) { /* ignore */ }
   }
 
+  // ── a cross-origin iframe on an extension page that came up blank ────────────
+  // A site decides who may embed it, and the list is written for Chrome. claude.ai
+  // serves its side-panel URL with
+  //   frame-ancestors 'self' chrome-extension://<their id> chrome-extension://<their id>
+  // and a converted extension page is safari-web-extension://<per-install UUID>, which
+  // cannot be on that list: the UUID differs per install and the header comes from the
+  // site's server. Safari computes the ancestor chain itself, so nothing on this side
+  // reaches the check. Safari's own DNR cannot modify response headers, and a
+  // modifyHeaders rule takes down its whole rule store, so those get stripped anyway.
+  //
+  // The user-visible result is a panel that is simply blank, plus one WebKit console line
+  // in a context most people never open. Say so in the frame instead. A blocked frame
+  // stays on its initial about:blank, which inherits THIS document's origin and is
+  // therefore writable; a frame that really loaded cross-origin gives contentDocument
+  // null, so a working frame can never be touched here.
+  if (typeof window !== "undefined" && typeof document !== "undefined"
+      && /^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) {
+    try {
+      var __selfOrigin = "";
+      try { __selfOrigin = location.origin || ""; } catch (e) {}
+      var __faSeen = {};
+      // Does the policy admit this extension? An exact origin can't be known by the
+      // site, but a scheme-source (safari-web-extension:) or a wildcard can allow it.
+      var __faAllowsUs = function (list) {
+        var parts = String(list).trim().split(/\s+/);
+        for (var i = 0; i < parts.length; i++) {
+          var p = parts[i].toLowerCase().replace(/;$/, "");
+          if (p === "*") return true;
+          if (p === __selfOrigin.toLowerCase()) return true;
+          if (/^(safari-web-extension|chrome-extension|moz-extension):$/.test(p)
+              && __selfOrigin.toLowerCase().indexOf(p) === 0) return true;
+        }
+        return false;
+      };
+      var __explain = function (frame, url) {
+        var doc = null;
+        // Cross-origin and loaded → null. Blocked → the inherited about:blank.
+        try { doc = frame.contentDocument; } catch (e) { return; }
+        if (!doc || !doc.body) return;
+        try { if (String(doc.URL || "") !== "about:blank") return; } catch (e) { return; }
+        try { if (doc.body.childNodes.length) return; } catch (e) { return; }   // never clobber content
+        var host = "";
+        try { host = new URL(url).host; } catch (e) { host = url; }
+        var msg = "Safari would not let this extension embed " + host + ".";
+        var why = "The site's Content-Security-Policy lists which origins may frame it, and a" +
+                  " converted extension's origin cannot be on that list.";
+        console.error("[c2s] iframe refused by " + host + "'s frame-ancestors policy: " + url +
+                      " — only " + host + " can change it (a scheme source such as" +
+                      " frame-ancestors safari-web-extension: would admit any install)." +
+                      " If this extension has a non-embedded mode, that one works.");
+        try {
+          var p = doc.createElement("p");
+          p.setAttribute("style", "margin:12px;font:13px/1.5 -apple-system,system-ui,sans-serif;color:#888");
+          p.textContent = msg + " " + why;
+          doc.body.appendChild(p);
+        } catch (e) {}
+        // Quote the real directive when it can be read, so the report is checkable.
+        try {
+          fetch(url, { method: "GET", credentials: "include" }).then(function (r) {
+            try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) {}
+            var csp = "";
+            try { csp = r.headers.get("content-security-policy") || ""; } catch (e) {}
+            var m = /frame-ancestors[^;]*/i.exec(csp);
+            if (m) console.error("[c2s] " + host + " sends: " + m[0].trim());
+          }, function () {});
+        } catch (e) {}
+      };
+      var __check = function (frame) {
+        var url = "";
+        try { url = frame.src || frame.getAttribute("src") || ""; } catch (e) { return; }
+        if (!/^https?:\/\//i.test(url)) return;                 // extension resources are ours
+        if (__faSeen[url]) return;
+        __faSeen[url] = true;
+        // Give the real load time to finish before judging it.
+        setTimeout(function () { try { __explain(frame, url); } catch (e) {} }, 2500);
+      };
+      var __scan = function (root) {
+        try {
+          var frames = root.querySelectorAll ? root.querySelectorAll("iframe") : [];
+          for (var i = 0; i < frames.length; i++) __check(frames[i]);
+        } catch (e) {}
+      };
+      if (typeof MutationObserver === "function") {
+        var __mo = new MutationObserver(function (recs) {
+          for (var i = 0; i < recs.length; i++) {
+            var added = recs[i].addedNodes || [];
+            for (var j = 0; j < added.length; j++) {
+              var n = added[j];
+              if (!n || n.nodeType !== 1) continue;
+              if (n.tagName === "IFRAME") __check(n);
+              else __scan(n);
+            }
+          }
+        });
+        try { __mo.observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) {}
+      }
+      try { __scan(document); } catch (e) {}
+    } catch (e) { /* never let this cost the page */ }
+  }
+
   } catch (__shimErr) {
     // A block threw despite its own guards (almost always a write to a frozen
     // Safari native). Swallow so the prepended host script still runs; surface in
