@@ -78,8 +78,23 @@
         reject(new Error("launchWebAuthFlow requires the tabs + webNavigation APIs, which are unavailable"));
         return;
       }
-      // DEBUG: always visible so you can see the authorize result.
-      api.tabs.create({ url: authUrl, active: true }, function (tab) {
+      // `interactive: false` is a silent token refresh, not a login. Chrome runs it with
+      // no visible UI and gives up quickly when the provider would need the user; a
+      // converted extension has only a real tab to work with, so keep that tab in the
+      // background and hold it to the caller's own short deadline.
+      //
+      // This matters for staying signed in. A bundle whose tokens live in
+      // storage.session loses them when Safari tears the background page down, and its
+      // designed recovery is exactly this silent re-auth (prompt=none plus a
+      // login_hint). Done with a focused tab and a 120s ceiling, every wake would steal
+      // focus and leave a stray tab sitting there long after the caller had given up
+      // and shown a login screen.
+      var interactive = !(details && details.interactive === false);
+      var quietMs = Number(details && details.timeoutMsForNonInteractive) || 5000;
+      // Chrome's default: a page that finishes loading without redirecting means the
+      // provider wants the user, so the silent attempt is over.
+      var abortOnLoad = !(details && details.abortOnLoadForNonInteractive === false);
+      api.tabs.create({ url: authUrl, active: interactive }, function (tab) {
         if (api.runtime.lastError || !tab) {
           console.error("[idpoly] tab create err", api.runtime.lastError);
           reject(new Error((api.runtime.lastError && api.runtime.lastError.message) || "tab create failed"));
@@ -87,16 +102,16 @@
         }
         var tabId = tab.id;
         var settled = false;
-        DBG("[idpoly] auth tab", tabId, "url", authUrl);
+        DBG("[idpoly] auth tab", tabId, "interactive", interactive, "url", authUrl);
         var timer = setTimeout(function () {
           DBGW("[idpoly] TIMEOUT", tabId);
           if (!settled) {
             settled = true;
             cleanup();
             try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
-            reject(new Error("launchWebAuthFlow timeout"));
+            reject(new Error(interactive ? "launchWebAuthFlow timeout" : "launchWebAuthFlow: no silent redirect"));
           }
-        }, 120000);
+        }, interactive ? 120000 : quietMs);
 
         function captured(url) {
           if (typeof url !== "string" || url.indexOf(redirectTarget) !== 0) return false;
@@ -125,11 +140,23 @@
         function onRemoved(id) {
           if (id === tabId) { DBGW("[idpoly] tab removed"); finish(reject, new Error("auth tab closed")); }
         }
+        function onDone(d) {
+          if (d.tabId !== tabId || d.frameId !== 0) return;
+          if (captured(d.url)) { finish(resolve, d.url); return; }
+          // A silent attempt whose page finished loading somewhere other than the
+          // redirect target is the provider asking for the user. Chrome ends the
+          // attempt there; hanging on would keep a background tab open on a login
+          // screen the caller has already stopped waiting for.
+          if (!interactive && abortOnLoad) {
+            DBG("[idpoly] silent attempt needs interaction, aborting");
+            finish(reject, new Error("launchWebAuthFlow: interaction required"));
+          }
+        }
         function cleanup() {
           clearTimeout(timer);
           api.webNavigation.onBeforeNavigate.removeListener(onNav);
           api.webNavigation.onCommitted.removeListener(onNav);
-          api.webNavigation.onCompleted.removeListener(onNav);
+          api.webNavigation.onCompleted.removeListener(onDone);
           api.webNavigation.onErrorOccurred.removeListener(onErr);
           api.tabs.onRemoved.removeListener(onRemoved);
         }
@@ -150,7 +177,7 @@
 
         api.webNavigation.onBeforeNavigate.addListener(onNav);
         api.webNavigation.onCommitted.addListener(onNav);
-        api.webNavigation.onCompleted.addListener(onNav);
+        api.webNavigation.onCompleted.addListener(onDone);
         api.webNavigation.onErrorOccurred.addListener(onErr);
         api.tabs.onRemoved.addListener(onRemoved);
       });

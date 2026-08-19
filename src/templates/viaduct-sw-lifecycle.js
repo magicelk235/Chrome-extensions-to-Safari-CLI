@@ -65,6 +65,39 @@
     try { self.skipWaiting = function () { return Promise.resolve(); }; } catch (e) {}
   }
 
+  // A bundle also asks whether it IS the worker, and routes on the answer:
+  //
+  //   if ("ServiceWorkerGlobalScope" in globalThis) return readTokenLocally();
+  //   const r = await chrome.runtime.sendMessage({ type: "check_and_refresh_oauth" });
+  //
+  // In Chrome the background is a ServiceWorkerGlobalScope, so it takes the local
+  // branch while panels and popups ask it over messaging. The conversion makes the
+  // background a PAGE, the global disappears, and the background falls into the
+  // asking branch: it messages itself, nothing answers (no context receives its own
+  // runtime message), and the work never happens. Claude for Chrome routes its OAuth
+  // refresh exactly this way, so the token stops being refreshed and the user is sent
+  // back to a login screen once it expires.
+  //
+  // A build-time rewrite cannot fix this, because the module that asks is usually
+  // shared with the panel, where the answer must stay NO. So answer at runtime, and
+  // only here: this file is loaded by the generated background.html alone. Other
+  // extension pages keep seeing no worker scope and keep asking the background, which
+  // is what keeps one refresh in one place rather than two racing over a
+  // single-use refresh token.
+  if (typeof self.ServiceWorkerGlobalScope === "undefined") {
+    try {
+      var SWGS = function ServiceWorkerGlobalScope() {};
+      // `self instanceof ServiceWorkerGlobalScope` is the other half of the idiom.
+      try {
+        Object.defineProperty(SWGS, Symbol.hasInstance, {
+          value: function (o) { return o === self || o === globalThis; },
+        });
+      } catch (e) {}
+      SWGS.prototype = Object.create(Object.prototype);
+      self.ServiceWorkerGlobalScope = SWGS;
+    } catch (e) {}
+  }
+
   function run() {
     setState("installing");
     dispatchExtendable("install")
