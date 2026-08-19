@@ -54,11 +54,48 @@ function runShim() {
     for (const f of updatedListeners) f(tabId, changeInfo, tab || { id: tabId });
   };
   const close = (tabId) => { for (const f of removedListeners) f(tabId); };
-  const relayRaw = (msg, sender) => { for (const f of messageListeners) f(msg, sender, () => {}); };
+  const relayRaw = (msg, sender, respond) => {
+    for (const f of messageListeners) f(msg, sender, respond || (() => {}));
+  };
   const relay = (url, sender) => relayRaw({ __c2sNav: { url } }, sender);
+  // What the sender actually reads: the answer to its own report.
+  const answerTo = (url, sender) => {
+    let answer;
+    relayRaw({ __c2sNav: { url } }, sender || { tab: { id: 1 }, frameId: 0 }, (r) => { answer = r; });
+    return answer;
+  };
   const dispose = () => { for (const h of timers) { clearTimeout(h); clearInterval(h); } timers.clear(); };
-  return { chrome, update, close, relay, relayRaw, dispose };
+  return { chrome, update, close, relay, relayRaw, answerTo, dispose };
 }
+
+test("the answer to a report says whether anything is listening", (t) => {
+  // A page-world pushState with no preceding input is invisible to a content script that
+  // only watches in bursts after input (measured on Safari 26: no re-injection, no report),
+  // and that is the navigation Cloaked's login turns on. So the content script watches
+  // continuously — but only where something listens, which is what this answer tells it.
+  const { chrome, answerTo, dispose } = runShim();
+  t.after(dispose);
+
+  // The answer object comes out of the VM realm, so read the field rather than compare shapes.
+  assert.equal(answerTo("https://a.example/1").__c2sNavWatch, false, "nobody listens yet");
+
+  const fn = () => {};
+  chrome.webNavigation.onHistoryStateUpdated.addListener(fn);
+  assert.equal(answerTo("https://a.example/2").__c2sNavWatch, true);
+
+  chrome.webNavigation.onReferenceFragmentUpdated.addListener(() => {});
+  chrome.webNavigation.onHistoryStateUpdated.removeListener(fn);
+  assert.equal(answerTo("https://a.example/3").__c2sNavWatch, true, "the fragment listener still wants it");
+});
+
+test("dropping the last listener stops asking pages for a standing watch", (t) => {
+  const { chrome, answerTo, dispose } = runShim();
+  t.after(dispose);
+  const fn = () => {};
+  chrome.webNavigation.onHistoryStateUpdated.addListener(fn);
+  chrome.webNavigation.onHistoryStateUpdated.removeListener(fn);
+  assert.equal(answerTo("https://a.example/9").__c2sNavWatch, false);
+});
 
 test("a same-document URL change fires onHistoryStateUpdated", (t) => {
   const { chrome, update, dispose } = runShim();

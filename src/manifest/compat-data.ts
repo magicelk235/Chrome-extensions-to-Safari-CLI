@@ -165,9 +165,12 @@ export const UNSUPPORTED_APIS: Record<
     fix: "Use webNavigation.onCommitted.",
   },
   "webNavigation.onHistoryStateUpdated": {
-    severity: "warning",
-    message: "webNavigation.onHistoryStateUpdated is unsupported.",
-    fix: "Monitor history changes from a content script.",
+    // Safari has no implementation; the shim feeds the event from the content script,
+    // which is exactly what the old advice here told the developer to write themselves.
+    severity: "info",
+    message: "webNavigation.onHistoryStateUpdated has no Safari surface; the shim emulates it (and onReferenceFragmentUpdated) from the content script, which reports the top frame's URL.",
+    fix: "No action needed on a granted site. A frame the user hasn't granted access to reports nothing, and a hidden tab is only caught when it is shown again.",
+    shimmed: true,
   },
   "chrome.tts\\b": {
     // Keep in sync with SHIMMED_PERMISSIONS/UNSUPPORTED_PERMISSIONS.tts: the shim

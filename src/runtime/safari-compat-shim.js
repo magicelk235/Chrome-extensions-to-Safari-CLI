@@ -228,6 +228,9 @@ var __C2S_DEBUG__ = false;
       addListener: function (f) { if (typeof f === "function") ls.push(f); },
       removeListener: function (f) { var i = ls.indexOf(f); if (i >= 0) ls.splice(i, 1); },
       hasListener: function (f) { return ls.indexOf(f) >= 0; },
+      // Whether anything is listening at all, for an emulation whose cost is only worth
+      // paying when someone reads it.
+      _count: function () { return ls.length; },
       // Snapshot before dispatch: Chrome dispatches to the listener set as it was
       // when the event fired, so a listener that removes itself (one-shot pattern)
       // must not shift the cursor and skip the next listener. Splicing a live array
@@ -4320,6 +4323,15 @@ var __C2S_DEBUG__ = false;
       var fragEv = eventList();
       chrome.webNavigation.onHistoryStateUpdated = histEv;
       chrome.webNavigation.onReferenceFragmentUpdated = fragEv;
+      // A content script cannot see the page's own pushState, and watching for one costs a
+      // timer in the page — a cost nobody should pay for an event their extension never
+      // reads. So the answer to each report below says whether anything is listening here,
+      // and the sender turns that into a standing watch. It rides the report that already
+      // exists: no extra message, and no storage key for a bundle that enumerates
+      // storage.local to trip over.
+      var __navWanted = function () {
+        try { return histEv._count() > 0 || fragEv._count() > 0; } catch (e) { return false; }
+      };
       var __lastTabUrl = Object.create(null);
       var __stripHash = function (u) { var i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); };
       // Both sources can describe the same navigation; emitting twice would double every
@@ -4351,7 +4363,7 @@ var __C2S_DEBUG__ = false;
 
       try {
         if (__isExtensionCtx && chrome.runtime && chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
-          chrome.runtime.onMessage.addListener(function (msg, sender) {
+          chrome.runtime.onMessage.addListener(function (msg, sender, respond) {
             if (!msg || !msg.__c2sNav || !sender) return;
             var tabId = sender.tab && sender.tab.id != null ? sender.tab.id : -1;
             var next = msg.__c2sNav.url;
@@ -4362,6 +4374,8 @@ var __C2S_DEBUG__ = false;
             var prev = __lastTabUrl[tabId];
             __lastTabUrl[tabId] = next;
             if (prev) __emitNav(tabId, prev, next, sender.frameId);
+            // Answered synchronously, so this reply wins over any the bundle might send.
+            try { if (typeof respond === "function") respond({ __c2sNavWatch: __navWanted() }); } catch (e) {}
           });
         }
       } catch (e) {}
@@ -6637,17 +6651,37 @@ var __C2S_DEBUG__ = false;
       && !/^(safari-web-extension|chrome-extension|moz-extension):$/.test(location.protocol)) {
     try {
       // This half holds NO cross-navigation state. Safari re-injects content scripts on
-      // same-document navigations (measured on GitHub: every Turbo click re-ran this
+      // some same-document navigations (measured on GitHub: every Turbo click re-ran this
       // file) AND gives each injection a fresh isolated world, so neither a closure nor a
       // property on `window` survives to be compared against — both get re-seeded to the
       // very URL being detected. So just announce the current URL on every injection and
       // let the background, which does persist, decide whether it changed.
       var __lastSent = null;
+      // Standing watch, armed by the background's answer to a report (below). Top frame
+      // only: an SPA route change is the top document's, and one timer per page is the
+      // budget. Safari freezes a hidden tab's timers outright (measured: a 1s interval
+      // stopped advancing until the tab was shown again), so a change made while hidden is
+      // caught on visibilitychange rather than by the timer.
+      var __standingTimer = null;
+      var __standingWatch = function () {
+        if (__standingTimer) return;
+        var isTop = false;
+        try { isTop = window.top === window; } catch (e) { isTop = false; }
+        if (!isTop) return;
+        try { __standingTimer = setInterval(function () { __navReport(); }, 350); } catch (e) {}
+      };
       var __navReport = function () {
         var next = location.href;
         if (next === __lastSent) return;
         __lastSent = next;
-        try { chrome.runtime.sendMessage({ __c2sNav: { url: next } }); } catch (e) {}
+        var answered = function (resp) {
+          void (chrome.runtime && chrome.runtime.lastError);
+          if (resp && resp.__c2sNavWatch) __standingWatch();
+        };
+        try {
+          var r = chrome.runtime.sendMessage({ __c2sNav: { url: next } }, answered);
+          if (r && typeof r.then === "function") r.then(answered, function () {});
+        } catch (e) {}
       };
       __navReport();
       // A content script runs in an ISOLATED WORLD, so patching history.pushState here
@@ -6656,10 +6690,15 @@ var __C2S_DEBUG__ = false;
       // saw nothing. location.href does reflect the result in both worlds, so watch that
       // instead. No world:MAIN injection, which would raise the Safari floor to 18.4.
       //
-      // Watched in short bursts after input rather than on a standing interval: SPA
-      // routing is user-driven, and a permanent timer in every frame of every page is a
-      // real cost for a rare event. Ceiling: a purely programmatic navigation with no
-      // preceding input (a timer-driven redirect) is missed until the next one.
+      // Watched in short bursts after input, plus a standing watch where the extension
+      // actually listens for the event. Bursts alone are not enough: measured on Safari 26,
+      // a page-world `history.pushState` with no preceding input neither re-injects this
+      // file nor produces any report, so the navigation is simply lost. That is the one
+      // that matters — Cloaked pushes its extension-auth status route seconds after the
+      // last click, once its token exchange returns, and installs the page↔extension
+      // bridge from the event. The standing watch is armed only when the background answers
+      // a report saying it has a listener, so an extension that never asked for SPA
+      // navigation still pays no timer.
       var __burstTimer = null;
       var __burstUntil = 0;
       var __watch = function () {
@@ -6675,11 +6714,17 @@ var __C2S_DEBUG__ = false;
           }, 150);
         } catch (e) {}
       };
+      try {
+        document.addEventListener("visibilitychange", function () {
+          if (!document.hidden) __navReport();
+        });
+      } catch (e) {}
       window.addEventListener("popstate", function () { __navReport(); __watch(); });
       window.addEventListener("hashchange", function () { __navReport(); __watch(); });
       window.addEventListener("pagehide", function () {
-        try { if (__burstTimer) clearInterval(__burstTimer); } catch (e) {}
+        try { clearInterval(__burstTimer); clearInterval(__standingTimer); } catch (e) {}
         __burstTimer = null;
+        __standingTimer = null;
       });
       try {
         // Capture phase: the page's own handler usually calls preventDefault and routes.

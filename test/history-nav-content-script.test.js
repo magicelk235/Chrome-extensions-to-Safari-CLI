@@ -17,8 +17,11 @@ import { shimSource } from "../dist/runtime/shim.js";
 // be compared against; both are re-seeded to the very URL being detected. So this half is
 // stateless: it announces the current URL on every injection and the background diffs.
 
-/** Model a content-script context on an http(s) origin. */
-function installContentScript(startUrl, protocol = "https:") {
+/**
+ * Model a content-script context on an http(s) origin. `navWatch` mirrors a background
+ * that has a listener registered, which is what it answers a nav report with.
+ */
+function installContentScript(startUrl, protocol = "https:", { navWatch = false, top = null } = {}) {
   const sent = [];
   const listeners = {};
   const docListeners = {};
@@ -30,7 +33,10 @@ function installContentScript(startUrl, protocol = "https:") {
       getURL: (p) => "safari-web-extension://TEST/" + String(p ?? ""),
       getManifest: () => ({ manifest_version: 3, action: {} }),
       onMessage: { addListener() {}, removeListener() {}, hasListener: () => false },
-      sendMessage: (m) => { sent.push(m); },
+      sendMessage: (m, cb) => {
+        sent.push(m);
+        if (m && m.__c2sNav && cb) cb({ __c2sNavWatch: navWatch });
+      },
       connect: () => ({ onDisconnect: { addListener() {} }, onMessage: { addListener() {} }, postMessage() {}, disconnect() {} }),
       onConnect: { addListener() {} },
     },
@@ -56,6 +62,8 @@ function installContentScript(startUrl, protocol = "https:") {
   sandbox.window = sandbox;
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
+  // A content script in the top frame sees window.top === window; a subframe does not.
+  sandbox.top = top === null ? sandbox : top;
   vm.createContext(sandbox);
   const inject = () => vm.runInContext(shimSource({ origin: "", hosts: [] }), sandbox, { filename: "safari-compat-shim.js" });
   inject();
@@ -114,14 +122,41 @@ test("a stationary page reports nothing", async (t) => {
   assert.equal(navs().length, 1, "only the install-time announcement");
 });
 
-test("an idle page arms no timer at all", async (t) => {
-  // A standing interval in every frame of every page was what made the suite hang; the
-  // watcher must stay dormant until there is input.
+test("an idle page arms no timer until the extension asks for one", async (t) => {
+  // A standing interval in every frame of every page was what made the suite hang, so it
+  // stays off for an extension that never listens for SPA navigation.
   const { sandbox, navs, dispose } = installContentScript("https://a.example/1");
   t.after(dispose);
   sandbox.location.href = "https://a.example/2";
   await settle(700);
-  assert.equal(navs().length, 1, "no input, no watcher — just the install announcement");
+  assert.equal(navs().length, 1, "no listener, no watcher — just the install announcement");
+});
+
+test("a programmatic route change is reported once the watch is armed", async (t) => {
+  // Regression: Cloaked's login. Its dashboard pushes the extension-auth status route
+  // seconds after the last click, when the token exchange returns, and installs the
+  // page↔extension bridge from the event. Measured on Safari 26, that push neither
+  // re-injects this file nor fires any input event, so a burst-only watcher saw nothing
+  // and the extension stayed logged out behind a page that said it had logged in.
+  const { sandbox, navs, dispose } = installContentScript("https://my.cloaked.com/extension-auth/issue/", "https:", { navWatch: true });
+  t.after(dispose);
+
+  sandbox.location.href = "https://my.cloaked.com/extension-auth/status/";
+  await settle(700);
+
+  assert.deepEqual(navs().map((n) => n.url), [
+    "https://my.cloaked.com/extension-auth/issue/",
+    "https://my.cloaked.com/extension-auth/status/",
+  ], "no click, no keypress, no re-injection — the standing watch is the only witness");
+});
+
+test("the standing watch stays out of subframes", async (t) => {
+  // An SPA route change is the top document's, and one timer per page is the budget.
+  const { sandbox, navs, dispose } = installContentScript("https://a.example/1", "https:", { navWatch: true, top: {} });
+  t.after(dispose);
+  sandbox.location.href = "https://a.example/2";
+  await settle(700);
+  assert.equal(navs().length, 1, "only the install-time announcement");
 });
 
 test("each hop is reported once, chained previous → url", async (t) => {
