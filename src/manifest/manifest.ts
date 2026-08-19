@@ -165,6 +165,70 @@ export { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS };
  */
 export const DEFAULT_MIN_SAFARI_VERSION = "15.4";
 
+/**
+ * Safari runs `world:"MAIN"` content scripts only from 18.4. Below that the entry is
+ * silently ignored — no error, no injection.
+ */
+export const MAIN_WORLD_MIN_SAFARI_VERSION = "18.4";
+
+/** Compare dotted version strings numerically. `cmpVersion("15.4","18.4") < 0`. */
+function cmpVersion(a: string, b: string): number {
+  const pa = String(a).split(".");
+  const pb = String(b).split(".");
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number.parseInt(pa[i] ?? "0", 10) || 0;
+    const nb = Number.parseInt(pb[i] ?? "0", 10) || 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+/**
+ * Raise the Safari floor to 18.4 when THIS CONVERSION injected a `world:"MAIN"` content
+ * script that cannot run below it, returning the version it replaced (or null when
+ * nothing changed). `injectedJs` names those scripts; nothing else is considered.
+ *
+ * Safari honors `world:"MAIN"` only from 18.4 and ignores the entry in silence below
+ * that. viaduct adds such entries after the transform has already written
+ * strict_min_version, so the emitted manifest claimed 15.4 while depending on 18.4
+ * behavior — a compatibility claim we don't meet, showing up as a feature that never
+ * runs (wirePageWorldMainInjection's page-world scripts, `d35e3ad`).
+ *
+ * Deliberately scoped to our own injections:
+ *
+ * - An entry the EXTENSION declared is the author's own compatibility claim, and the
+ *   analyzer's long-standing stance on it is a warning plus "provide an ISOLATED-world
+ *   fallback, or feature-detect and degrade on older Safari" (`a40114e`). Raising the
+ *   floor there would refuse to install on Safari 15.4–18.3 an extension whose MAIN-world
+ *   script may well be optional — trading a degraded feature for no extension at all.
+ * - `page-bridge.js` is never passed here: when Safari ignores its entry the isolated-world
+ *   relay injects it as a web-accessible <script> instead, so it works below 18.4 and must
+ *   not cost those users the install either.
+ */
+export function raiseMinVersionForMainWorld(
+  manifest: Manifest,
+  injectedJs: string[]
+): string | null {
+  const scripts = manifest.content_scripts;
+  if (!Array.isArray(scripts) || injectedJs.length === 0) return null;
+  const needsFloor = scripts.some(
+    (cs) => cs && cs.world === "MAIN" && Array.isArray(cs.js) && cs.js.some((f) => injectedJs.includes(f))
+  );
+  if (!needsFloor) return null;
+  // browser_specific_settings is Record<string, unknown> (unguarded JSON.parse output
+  // upstream), so read through it rather than asserting a shape onto it.
+  const bss = manifest.browser_specific_settings ?? {};
+  const safari = bss.safari;
+  const existing: Record<string, unknown> =
+    safari && typeof safari === "object" && !Array.isArray(safari) ? { ...safari } : {};
+  const declared = existing.strict_min_version;
+  const current = typeof declared === "string" ? declared : undefined;
+  if (current && cmpVersion(current, MAIN_WORLD_MIN_SAFARI_VERSION) >= 0) return null;
+  existing.strict_min_version = MAIN_WORLD_MIN_SAFARI_VERSION;
+  manifest.browser_specific_settings = { ...bss, safari: existing };
+  return current ?? DEFAULT_MIN_SAFARI_VERSION;
+}
+
 export interface ManifestAnalysis {
   issues: Issue[];
   permissionsToRemove: string[];
