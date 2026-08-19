@@ -483,6 +483,13 @@ async function main(): Promise<void> {
     }
   }
 
+  // Every report of "your fix didn't work" starts with figuring out which version
+  // actually ran, and nothing in a run used to say. The GUI compounds it: it updates
+  // its bundled CLI in the background, so the user cannot know which one their
+  // conversion used either. One line on stderr — it lands in a pasted terminal log and
+  // in the app's log pane, and stdout stays clean for --analyze --json.
+  info(`viaduct ${pkgVersion()}`);
+
   // Team detection is the same for every input; do it once up front. Remember
   // whether a team was asked for even after the fallback clears it, so the
   // signature check can tell "ad-hoc because you asked" from "ad-hoc because we
