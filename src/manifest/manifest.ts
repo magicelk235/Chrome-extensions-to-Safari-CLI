@@ -70,7 +70,23 @@ export function parseJsonc<T = unknown>(text: string): T {
 
 export function loadManifest(extPath: string): Manifest {
   const p = join(extPath, "manifest.json");
-  if (!existsSync(p)) throw new Error(`No manifest.json found in ${extPath}`);
+  if (!existsSync(p)) {
+    // Name what IS there. Reports of this error are otherwise undebuggable: the
+    // usual cause is an archive that holds something else — a store page saved as
+    // .zip, a source tarball, an extension nested two levels deep, another archive
+    // inside the archive — and the listing says which at a glance.
+    let listing = "";
+    try {
+      const entries = readdirSync(extPath).filter((e) => e !== ".DS_Store" && e !== "__MACOSX");
+      listing = entries.length
+        ? `\n  It contains: ${entries.slice(0, 12).join(", ")}${entries.length > 12 ? `, … (${entries.length} entries)` : ""}`
+        : "\n  It is empty.";
+    } catch {}
+    throw new Error(
+      `No manifest.json found in ${extPath}.${listing}\n` +
+        "  Point viaduct at the folder holding manifest.json, or at the .crx/.zip Chrome itself packed.",
+    );
+  }
   return parseJsonc<Manifest>(readFileSync(p, "utf-8"));
 }
 

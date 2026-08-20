@@ -850,6 +850,49 @@ function pickScheme(xcodeproj: string, appName: string, platforms: Platforms): s
 }
 
 /**
+ * xcodebuild splits a failed build across both streams: the diagnostics that say
+ * WHY ("… error: No Account for Team "X" …") go to stdout, while stderr carries
+ * only the "** BUILD FAILED **" summary and run-destination noise. Printing
+ * stderr and falling back to stdout only when stderr is empty therefore hid every
+ * signing error behind a summary that names no cause (issue #15). Collect the
+ * diagnostics from both streams instead, and keep the tail of the raw output as the
+ * last resort for a failure that carries no diagnostic at all.
+ */
+export function xcodebuildDiagnostics(res: { stdout: string; stderr: string }): string {
+  const combined = `${res.stdout}\n${res.stderr}`;
+  // Keyed on the diagnostic without its trailing "(in target 'X' from project 'Y')":
+  // xcodebuild reports one signing failure once per target, and four lines saying the
+  // same thing bury the two that differ. First occurrence wins, target and all.
+  const seen = new Map<string, string>();
+  for (const line of combined.split("\n")) {
+    if (!/(?:^|\s)(?:error|fatal error):/.test(line)) continue;
+    const text = line.trim();
+    if (!text) continue;
+    const key = text.replace(/\s*\(in target '.*$/, "");
+    if (!seen.has(key)) seen.set(key, text);
+    // A thousand compile errors are no more informative than the first few, and this
+    // lands in a terminal (and in bug reports).
+    if (seen.size >= 20) break;
+  }
+  return seen.size ? [...seen.values()].join("\n") : combined.trim().slice(-2000);
+}
+
+/** Signing failures xcodebuild reports when the team it was handed is not one this
+ *  machine can sign for: no Apple account, no certificate, no profile. These are
+ *  recoverable by dropping to ad-hoc; a compile error is not. */
+const SIGNING_FAILURE =
+  /error:.*(No Account for Team|No signing certificate|requires a development team|No profiles for|Failed to (?:register bundle identifier|create provisioning profile)|Provisioning profile .* (?:doesn't|does not) )/;
+
+export interface XcodeBuildResult {
+  builtApp: string;
+  derivedDir: string;
+  /** The team-signed build failed for a signing reason and the app was rebuilt
+   *  ad-hoc instead, so the artifact carries no team signature and Safari needs
+   *  its unsigned-extensions toggle. */
+  adHocFallback?: boolean;
+}
+
+/**
  * Build the Xcode project. With `team` → automatic Apple-issued dev signing, which
  * Safari loads WITHOUT the session-scoped "Allow Unsigned Extensions" toggle, so the
  * extension survives quitting Safari. Without `team` → ad-hoc signing (needs the toggle,
@@ -861,81 +904,106 @@ export function buildXcodeProject(
   xcodeproj: string,
   appName: string,
   platforms: Platforms,
-  team?: string
-): { builtApp: string; derivedDir: string } | null {
+  team?: string,
+  opts: { teamAutoDetected?: boolean } = {}
+): XcodeBuildResult | null {
   const scheme = pickScheme(xcodeproj, appName, platforms);
   if (!scheme) {
     warn("No Xcode scheme found; skipping build.");
     return null;
   }
-  // Build into a temp DerivedData OUTSIDE the project tree. When the project lives on
-  // an iCloud-synced volume (e.g. ~/Desktop or ~/Documents), the file provider stamps
-  // the freshly built .appex with `com.apple.fileprovider.fpfs#P` / `com.apple.FinderInfo`,
-  // and codesign then aborts with "resource fork, Finder information, or similar detritus
-  // not allowed" — so signing the App Sandbox entitlement fails and the build dies.
-  // $TMPDIR is never file-provider managed, so the bundle stays clean for signing.
-  const derived = mkdtempSync(join(tmpdir(), "c2s-dd-"));
-  const signing = team
-    ? [
-        // Real Apple-issued development signing. Automatic style + -allowProvisioningUpdates
-        // lets Xcode create/refresh the development provisioning profile (the App Sandbox
-        // entitlement requires one). A team-signed extension loads in Safari without the
-        // unsigned toggle and persists across restarts.
-        "-allowProvisioningUpdates",
-        "CODE_SIGN_STYLE=Automatic",
-        `DEVELOPMENT_TEAM=${team}`,
-        "CODE_SIGN_IDENTITY=Apple Development",
-      ]
-    : [
-        // Ad-hoc sign WITH entitlements. The targets set ENABLE_APP_SANDBOX=YES, which
-        // Xcode turns into the App Sandbox entitlement at sign time — and Safari refuses
-        // to register a web-extension appex that lacks it. CODE_SIGNING_ALLOWED=NO skips
-        // signing AND entitlement application, so the extension silently never appears in
-        // Safari. Manual style + empty team/profile lets the ad-hoc "-" identity sign
-        // without a provisioning profile.
-        "CODE_SIGN_IDENTITY=-",
-        "CODE_SIGN_STYLE=Manual",
-        "DEVELOPMENT_TEAM=",
-        "PROVISIONING_PROFILE_SPECIFIER=",
-        "CODE_SIGNING_REQUIRED=NO",
-      ];
-  const args = [
-    "-project",
-    xcodeproj,
-    "-scheme",
-    scheme,
-    "-configuration",
-    "Release",
-    "-derivedDataPath",
-    derived,
-    ...signing,
-    "build",
-  ];
-  info(`xcodebuild -scheme "${scheme}" (${team ? `team ${team}` : "ad-hoc"} signed)`);
-  const res = run("xcodebuild", args);
-  if (res.code !== 0) {
-    warn(`build failed:\n${res.stderr.slice(-2000) || res.stdout.slice(-2000)}`);
-    rmSync(derived, { recursive: true, force: true });
-    return null;
-  }
-  // Search the whole Products dir, not just Release/: macOS lands the app in
-  // "Release", but an iOS build puts it in the SDK-suffixed "Release-iphoneos"
-  // sibling — a hardcoded "Release" path finds no .app for iOS, so the build
-  // reads as failed. The name match below still prevents a wrong-platform bundle.
-  const productsDir = join(derived, "Build", "Products");
-  const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 4);
-  // Match the app we built by name; a multi-platform Products dir can hold several .app
-  // bundles, and readdir order is not guaranteed, so [0] could be the wrong one — never
-  // fall back to an arbitrary bundle (it could be the iOS app for a macOS build).
-  const built = apps.find((p) => basename(p) === `${appName}.app`);
-  if (!built) {
-    rmSync(derived, { recursive: true, force: true });
-    return null;
-  }
+  // One xcodebuild run. Kept as a closure so a team-signed build that dies on
+  // signing can be retried ad-hoc without redoing scheme lookup.
+  const attempt = (
+    signWithTeam: string | undefined,
+  ): { app: string; derived: string } | { signingFailure: boolean } => {
+    // Build into a temp DerivedData OUTSIDE the project tree. When the project lives on
+    // an iCloud-synced volume (e.g. ~/Desktop or ~/Documents), the file provider stamps
+    // the freshly built .appex with `com.apple.fileprovider.fpfs#P` / `com.apple.FinderInfo`,
+    // and codesign then aborts with "resource fork, Finder information, or similar detritus
+    // not allowed" — so signing the App Sandbox entitlement fails and the build dies.
+    // $TMPDIR is never file-provider managed, so the bundle stays clean for signing.
+    const derived = mkdtempSync(join(tmpdir(), "c2s-dd-"));
+    const signing = signWithTeam
+      ? [
+          // Real Apple-issued development signing. Automatic style + -allowProvisioningUpdates
+          // lets Xcode create/refresh the development provisioning profile (the App Sandbox
+          // entitlement requires one). A team-signed extension loads in Safari without the
+          // unsigned toggle and persists across restarts.
+          "-allowProvisioningUpdates",
+          "CODE_SIGN_STYLE=Automatic",
+          `DEVELOPMENT_TEAM=${signWithTeam}`,
+          "CODE_SIGN_IDENTITY=Apple Development",
+        ]
+      : [
+          // Ad-hoc sign WITH entitlements. The targets set ENABLE_APP_SANDBOX=YES, which
+          // Xcode turns into the App Sandbox entitlement at sign time — and Safari refuses
+          // to register a web-extension appex that lacks it. CODE_SIGNING_ALLOWED=NO skips
+          // signing AND entitlement application, so the extension silently never appears in
+          // Safari. Manual style + empty team/profile lets the ad-hoc "-" identity sign
+          // without a provisioning profile.
+          "CODE_SIGN_IDENTITY=-",
+          "CODE_SIGN_STYLE=Manual",
+          "DEVELOPMENT_TEAM=",
+          "PROVISIONING_PROFILE_SPECIFIER=",
+          "CODE_SIGNING_REQUIRED=NO",
+        ];
+    const args = [
+      "-project",
+      xcodeproj,
+      "-scheme",
+      scheme,
+      "-configuration",
+      "Release",
+      "-derivedDataPath",
+      derived,
+      ...signing,
+      "build",
+    ];
+    info(`xcodebuild -scheme "${scheme}" (${signWithTeam ? `team ${signWithTeam}` : "ad-hoc"} signed)`);
+    const res = run("xcodebuild", args);
+    if (res.code !== 0) {
+      warn(`build failed:\n${xcodebuildDiagnostics(res)}`);
+      rmSync(derived, { recursive: true, force: true });
+      return { signingFailure: SIGNING_FAILURE.test(`${res.stdout}\n${res.stderr}`) };
+    }
+    // Search the whole Products dir, not just Release/: macOS lands the app in
+    // "Release", but an iOS build puts it in the SDK-suffixed "Release-iphoneos"
+    // sibling — a hardcoded "Release" path finds no .app for iOS, so the build
+    // reads as failed. The name match below still prevents a wrong-platform bundle.
+    const productsDir = join(derived, "Build", "Products");
+    const apps = findFiles(productsDir, (n) => n.endsWith(".app"), 4);
+    // Match the app we built by name; a multi-platform Products dir can hold several .app
+    // bundles, and readdir order is not guaranteed, so [0] could be the wrong one — never
+    // fall back to an arbitrary bundle (it could be the iOS app for a macOS build).
+    const built = apps.find((p) => basename(p) === `${appName}.app`);
+    if (!built) {
+      rmSync(derived, { recursive: true, force: true });
+      return { signingFailure: false };
+    }
+    return { app: built, derived };
+  };
+
   // Hand the signed .app back where it sits (in DerivedData). The caller moves it to its
   // final home in one hop — no copy onto the iCloud-synced project tree — then deletes
   // derivedDir. A move preserves the signature/seal untouched (no re-stamp, no re-sign).
-  return { builtApp: built, derivedDir: derived };
+  const first = attempt(team);
+  if ("app" in first) return { builtApp: first.app, derivedDir: first.derived };
+
+  // An auto-detected team can turn out to be one this machine cannot sign for — an
+  // expired certificate, a revoked account, a free team that hit Apple's app-id
+  // limit. The user asked for "whatever signing you can manage", so finish the
+  // conversion ad-hoc instead of throwing the whole run away; the caller adjusts
+  // its signing expectation and tells the user about the unsigned toggle.
+  if (!team || !opts.teamAutoDetected || !first.signingFailure) return null;
+  warn(
+    `Team ${team} cannot sign on this Mac (see the error above) — rebuilding ad-hoc so the conversion still produces an app.\n` +
+      "  Ad-hoc extensions need Safari → Develop → \"Allow Unsigned Extensions\" re-ticked after every Safari restart.\n" +
+      "  To get a team-signed build, sign in to Xcode → Settings → Accounts, then re-run.",
+  );
+  const retry = attempt(undefined);
+  if (!("app" in retry)) return null;
+  return { builtApp: retry.app, derivedDir: retry.derived, adHocFallback: true };
 }
 
 export function plistValue(plistPath: string, key: string): string | null {
@@ -1012,13 +1080,26 @@ const TEAM_ID = "([A-Z0-9]{10})(?![A-Z0-9])";
  * Best-effort read of an Apple Developer Team ID, so the tool can team-sign
  * without the user knowing or passing the id. The team id is all the build
  * needs: xcodebuild runs with -allowProvisioningUpdates, so Xcode mints the
- * development certificate and profile on demand. Sources, tried in order:
- * Xcode's cached team list, xcodebuild's copy of it, any provisioning profile
- * already on disk, then the codesigning identity in the keychain. Returns null
- * only when none of them yields one.
+ * development certificate and profile on demand. Sources: Xcode's cached team
+ * list (and xcodebuild's copy of it), the provisioning profiles on disk, and the
+ * codesigning identities in the keychain. Returns null when nothing usable turns
+ * up, which the caller reports as an ad-hoc fallback.
+ *
+ * A team id lying on disk is not proof this Mac can sign for it. Profiles outlive
+ * the account that installed them, and installers drop profiles for their vendor's
+ * team — issue #15 auto-detected a third-party vendor's team on a Mac with no Apple
+ * account, so every build died on "No Account for Team". Only a team Xcode holds an
+ * account for, or one with a certificate in the keychain, can actually sign. So a
+ * profile now only chooses among those; it never nominates a team on its own.
  */
 export function detectXcodeTeam(): string | null {
-  return teamFromPrefs() ?? teamFromProvisioningProfiles() ?? teamFromKeychain();
+  const accounts = teamsFromPrefs();
+  const certs = teamsFromKeychain();
+  const signable = new Set([...accounts, ...certs]);
+  // Newest profile first, so when the keychain holds several teams the pick is the
+  // one the user most recently provisioned for.
+  const provisioned = teamsFromProvisioningProfiles().filter((id) => signable.has(id));
+  return accounts[0] ?? provisioned[0] ?? certs[0] ?? null;
 }
 
 /**
@@ -1029,16 +1110,18 @@ export function detectXcodeTeam(): string | null {
  * all four costs four cheap `defaults` calls and covers machines where only one
  * of them was ever written.
  */
-function teamFromPrefs(): string | null {
+function teamsFromPrefs(): string[] {
+  const found: string[] = [];
   for (const domain of ["com.apple.dt.Xcode", "com.apple.dt.xcodebuild"]) {
     for (const key of ["IDEProvisioningTeamByIdentifier", "IDEProvisioningTeams"]) {
       const res = run("defaults", ["read", domain, key]);
       if (res.code !== 0) continue;
-      const id = res.stdout.match(new RegExp(`teamID\\s*=\\s*"?${TEAM_ID}"?`))?.[1];
-      if (id) return id;
+      for (const m of res.stdout.matchAll(new RegExp(`teamID\\s*=\\s*"?${TEAM_ID}"?`, "g"))) {
+        if (!found.includes(m[1])) found.push(m[1]);
+      }
     }
   }
-  return null;
+  return found;
 }
 
 /** Where Xcode keeps provisioning profiles it has downloaded, macOS then iOS. */
@@ -1048,12 +1131,12 @@ const PROFILE_DIRS = [
 ];
 
 /**
- * Team id off a provisioning profile. Profiles are CMS-signed but the payload
- * plist sits in the blob as plain XML, so a scan beats shelling out to
- * `security cms -D` once per file. Newest profile wins — it reflects the team
- * the user most recently provisioned for.
+ * Team ids off the provisioning profiles on disk, newest profile first — that
+ * order is what makes the most recently provisioned team win. Profiles are
+ * CMS-signed but the payload plist sits in the blob as plain XML, so a scan beats
+ * shelling out to `security cms -D` once per file.
  */
-function teamFromProvisioningProfiles(): string | null {
+function teamsFromProvisioningProfiles(): string[] {
   const profiles: { path: string; mtime: number }[] = [];
   for (const dir of PROFILE_DIRS) {
     let entries;
@@ -1072,6 +1155,7 @@ function teamFromProvisioningProfiles(): string | null {
     }
   }
   profiles.sort((a, b) => b.mtime - a.mtime);
+  const found: string[] = [];
   for (const profile of profiles) {
     let xml;
     try {
@@ -1089,9 +1173,9 @@ function teamFromProvisioningProfiles(): string | null {
           `\\s*(?:<array>\\s*)?<string>${TEAM_ID}</string>`,
       ),
     )?.[1];
-    if (id) return id;
+    if (id && !found.includes(id)) found.push(id);
   }
-  return null;
+  return found;
 }
 
 /**
@@ -1111,13 +1195,14 @@ const SIGNING_CERT_PREFIXES = [
 ];
 
 /**
- * Team ID read off the signing certificate itself, used when nothing Xcode
- * wrote to disk yields one. The certificate is the most authoritative source:
- * it is what codesign consumes, and Apple puts the team id in the subject's OU.
+ * Team ids read off the signing certificates themselves, best cert class first.
+ * The certificate is the most authoritative source: it is what codesign consumes,
+ * and Apple puts the team id in the subject's OU. `-v` keeps expired and
+ * private-key-less certificates out, so every id here is one this Mac can sign with.
  */
-function teamFromKeychain(): string | null {
+function teamsFromKeychain(): string[] {
   const list = run("security", ["find-identity", "-v", "-p", "codesigning"]);
-  if (list.code !== 0) return null;
+  if (list.code !== 0) return [];
   // Lines look like:  1) <sha1> "Apple Development: me@example.com (XXXXXXXXXX)"
   const names = [...list.stdout.matchAll(/"([^"]+)"/g)]
     .map((m) => m[1])
@@ -1127,15 +1212,16 @@ function teamFromKeychain(): string | null {
         SIGNING_CERT_PREFIXES.findIndex((p) => a.startsWith(p)) -
         SIGNING_CERT_PREFIXES.findIndex((p) => b.startsWith(p)),
     );
+  const found: string[] = [];
   for (const name of names) {
     const pem = run("security", ["find-certificate", "-c", name, "-p"]);
     if (pem.code !== 0 || !pem.stdout.includes("BEGIN CERTIFICATE")) continue;
     const subject = run("openssl", ["x509", "-noout", "-subject"], { input: pem.stdout });
     if (subject.code !== 0) continue;
     const ou = subject.stdout.match(new RegExp(`OU\\s*=\\s*${TEAM_ID}`));
-    if (ou) return ou[1];
+    if (ou && !found.includes(ou[1])) found.push(ou[1]);
   }
-  return null;
+  return found;
 }
 
 /**

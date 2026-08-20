@@ -422,7 +422,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
     }
 
     info(opts.team ? `Building (signed: team ${opts.team}) …` : "Building (ad-hoc signed) …");
-    const build = buildXcodeProject(xcodeproj, appName, opts.platforms, opts.team);
+    const build = buildXcodeProject(xcodeproj, appName, opts.platforms, opts.team, {
+      teamAutoDetected: opts.teamAutoDetected,
+    });
     if (!build) {
       fail("Build failed. See output above.");
       printIssues(issues);
@@ -431,6 +433,11 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const builtApp = build.builtApp;
     derivedDir = build.derivedDir;
     ok(`Built & signed → ${builtApp}`);
+    // Everything downstream keys off how the app is ACTUALLY signed, not what was
+    // asked for: a team-signed build that fell back to ad-hoc still needs Safari's
+    // unsigned toggle and must not be installed as if it were team-signed.
+    const team = build.adHocFallback ? undefined : opts.team;
+    if (build.adHocFallback) result.signedAdHoc = true;
 
     // The check v2 lacked: confirm the COMPILED bundle ids match intent (before it moves).
     const v = verifyBuiltBundleId(builtApp, bundleId);
@@ -448,7 +455,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     if (pk) info(`pluginkit:\n${pk}`);
 
     // The unsigned toggle only matters for ad-hoc builds; a team-signed app ignores it.
-    if (!opts.team) {
+    if (!team) {
       const allowed = unsignedExtensionsAllowed();
       if (allowed === false) {
         warn('Safari "Allow Unsigned Extensions" is OFF — enable it (Develop menu) or the extension will not load.');
@@ -465,7 +472,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
         bundleId,
         installDir: opts.installDir,
         safariRestart: opts.safariRestart,
-        signed: !!opts.team,
+        signed: !!team,
       });
       if (inst.installedAppPath) {
         result.appPath = inst.installedAppPath;

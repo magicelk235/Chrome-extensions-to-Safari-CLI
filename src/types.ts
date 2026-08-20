@@ -99,6 +99,10 @@ export interface ConvertOptions {
   safariRestart: boolean;
   /** Apple Developer Team ID to sign with (real signing → persists across Safari quits). */
   team?: string;
+  /** `team` came from detection (--team auto / plain --install), not from the user
+   *  naming it. A detected team that turns out to be unable to sign falls back to
+   *  an ad-hoc build rather than failing the run. */
+  teamAutoDetected?: boolean;
 }
 
 export interface ConvertResult {
@@ -124,4 +128,8 @@ export interface ConvertResult {
    *  reads as "the extension doesn't work" (live: TWP translate). The CLI prints
    *  the grant step when this is set. */
   needsWebsiteAccessGrant?: boolean;
+  /** The build was asked to team-sign, the team could not sign, and the app was
+   *  rebuilt ad-hoc. The artifact carries no team signature, so the caller must not
+   *  report it as team-signed and must mention Safari's unsigned toggle. */
+  signedAdHoc?: boolean;
 }

@@ -121,22 +121,41 @@ exit 1
 `;
 }
 
-/** `security` + `openssl` stubs standing in for one keychain identity. */
-function keychainStub(identity, team) {
+/**
+ * `security` + `openssl` stubs standing in for the given keychain identities, in
+ * the order `security find-identity` lists them. Each identity's team is the one
+ * in its parenthesized suffix, carried through the fake PEM so the openssl stub
+ * can answer per-certificate.
+ */
+function keychainStub(...identities) {
+  const lines = identities.map((n, i) => `  ${i + 1}) DEADBEEF${i} "${n}"`).join("\n");
   return {
     security: `#!/bin/sh
 case "$1" in
-  find-identity) echo '  1) DEADBEEF "${identity}"'; exit 0;;
-  find-certificate) echo "-----BEGIN CERTIFICATE-----"; echo "ZmFrZQ=="; echo "-----END CERTIFICATE-----"; exit 0;;
+  find-identity)
+cat <<'IDENT'
+${lines}
+IDENT
+    exit 0;;
+  find-certificate)
+    team=$(printf '%s' "$3" | tr -d ')' | awk -F'(' '{print $2}')
+    echo "-----BEGIN CERTIFICATE-----"
+    echo "$team"
+    echo "-----END CERTIFICATE-----"
+    exit 0;;
 esac
 exit 1
 `,
     openssl: `#!/bin/sh
-cat >/dev/null
-echo "subject=UID=${team}, CN=${identity}, OU=${team}, O=Example, C=US"
+team=$(sed -n '2p')
+echo "subject=UID=$team, CN=cert, OU=$team, O=Example, C=US"
 `,
   };
 }
+
+/** Two development certificates, so a profile has something to choose between. */
+const twoCerts = (first, second) =>
+  keychainStub(`Apple Development: me@example.com (${first})`, `Apple Development: me@example.com (${second})`);
 
 const XCODE_PROFILES = ["Library", "Developer", "Xcode", "UserData", "Provisioning Profiles"];
 const LEGACY_PROFILES = ["Library", "MobileDevice", "Provisioning Profiles"];
@@ -148,6 +167,10 @@ const wrap = (body) => `<plist version="1.0"><dict>${body}</dict></plist>`;
 // profile directory moved in Xcode 16, TeamIdentifier only appeared in profiles
 // around Xcode 6, and a paid account that has never made a development cert has
 // nothing in the keychain but a Developer ID one.
+//
+// The profile cases pair each profile with a keychain holding two teams: a profile
+// picks which of the machine's teams to use (the most recently provisioned one), so
+// the parse has to work for the profile's team to win over the keychain's own order.
 const CASES = [
   {
     name: "IDEProvisioningTeamByIdentifier in the Xcode domain",
@@ -171,42 +194,54 @@ const CASES = [
   },
   {
     name: "a profile in the Xcode 16 location",
-    env: { profiles: [{ dir: XCODE_PROFILES, name: "a.provisionprofile", plist: wrap("<key>TeamIdentifier</key><array><string>EE55555555</string></array>") }] },
+    env: {
+      shell: twoCerts("ZZ00000000", "EE55555555"),
+      profiles: [{ dir: XCODE_PROFILES, name: "a.provisionprofile", plist: wrap("<key>TeamIdentifier</key><array><string>EE55555555</string></array>") }],
+    },
     team: "EE55555555",
   },
   {
     name: "a profile in the pre-Xcode 16 location",
-    env: { profiles: [{ dir: LEGACY_PROFILES, name: "a.mobileprovision", plist: wrap("<key>TeamIdentifier</key><array><string>FF66666666</string></array>") }] },
+    env: {
+      shell: twoCerts("ZZ00000000", "FF66666666"),
+      profiles: [{ dir: LEGACY_PROFILES, name: "a.mobileprovision", plist: wrap("<key>TeamIdentifier</key><array><string>FF66666666</string></array>") }],
+    },
     team: "FF66666666",
   },
   {
     name: "a pre-Xcode 6 profile that predates TeamIdentifier",
-    env: { profiles: [{ dir: LEGACY_PROFILES, name: "a.mobileprovision", plist: wrap("<key>ApplicationIdentifierPrefix</key><array><string>GG77777777</string></array>") }] },
+    env: {
+      shell: twoCerts("ZZ00000000", "GG77777777"),
+      profiles: [{ dir: LEGACY_PROFILES, name: "a.mobileprovision", plist: wrap("<key>ApplicationIdentifierPrefix</key><array><string>GG77777777</string></array>") }],
+    },
     team: "GG77777777",
   },
   {
     name: "the team-identifier entitlement inside a profile",
-    env: { profiles: [{ dir: XCODE_PROFILES, name: "a.provisionprofile", plist: wrap("<key>Entitlements</key><dict><key>com.apple.developer.team-identifier</key><string>HH88888888</string></dict>") }] },
+    env: {
+      shell: twoCerts("ZZ00000000", "HH88888888"),
+      profiles: [{ dir: XCODE_PROFILES, name: "a.provisionprofile", plist: wrap("<key>Entitlements</key><dict><key>com.apple.developer.team-identifier</key><string>HH88888888</string></dict>") }],
+    },
     team: "HH88888888",
   },
   {
     name: "an Apple Development certificate",
-    env: { shell: keychainStub("Apple Development: me@example.com (II99999999)", "II99999999") },
+    env: { shell: keychainStub("Apple Development: me@example.com (II99999999)") },
     team: "II99999999",
   },
   {
     name: "a Mac Developer certificate from an older Xcode",
-    env: { shell: keychainStub("Mac Developer: me@example.com (JJ10101010)", "JJ10101010") },
+    env: { shell: keychainStub("Mac Developer: me@example.com (JJ10101010)") },
     team: "JJ10101010",
   },
   {
     name: "a Developer ID certificate, the only one some paid accounts have",
-    env: { shell: keychainStub("Developer ID Application: Example Ltd (KK11111111)", "KK11111111") },
+    env: { shell: keychainStub("Developer ID Application: Example Ltd (KK11111111)") },
     team: "KK11111111",
   },
   {
     name: "a Mac App Store distribution certificate",
-    env: { shell: keychainStub("3rd Party Mac Developer Application: Example (LL12121212)", "LL12121212") },
+    env: { shell: keychainStub("3rd Party Mac Developer Application: Example (LL12121212)") },
     team: "LL12121212",
   },
 ];
@@ -226,4 +261,28 @@ test("detectXcodeTeam ignores a token that only looks like a team id", () => {
   // would hand xcodebuild a plausible but wrong id.
   const shell = { defaults: defaultsStub("com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier", "{ x = ( { teamID = AA111111112; } ); }") };
   assert.equal(detectIn({ shell }), "null");
+});
+
+// Issue #15: `--team auto` picked a third-party vendor's team id off a
+// provisioning profile on a Mac with no Apple account, and every build after that
+// died on `error: No Account for Team "…"`. A team id lying on disk is not proof
+// this Mac can sign for it, so a profile alone must never nominate one.
+test("a profile for a team with no account and no certificate is not used", () => {
+  const profiles = [
+    { dir: XCODE_PROFILES, name: "vendor.provisionprofile", plist: wrap("<key>TeamIdentifier</key><array><string>UBF8T346G9</string></array>") },
+  ];
+  assert.equal(detectIn({ profiles }), "null");
+  // …and it must not outrank the team this machine can actually sign with.
+  assert.equal(detectIn({ profiles, shell: keychainStub("Apple Development: me@example.com (MM13131313)") }), "MM13131313");
+});
+
+test("an Xcode account team wins over a profile the keychain cannot back", () => {
+  const shell = {
+    ...keychainStub("Apple Development: me@example.com (NN14141414)"),
+    defaults: defaultsStub("com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier", '{ x = ( { teamID = NN14141414; } ); }'),
+  };
+  const profiles = [
+    { dir: XCODE_PROFILES, name: "vendor.provisionprofile", plist: wrap("<key>TeamIdentifier</key><array><string>UBF8T346G9</string></array>") },
+  ];
+  assert.equal(detectIn({ shell, profiles }), "NN14141414");
 });

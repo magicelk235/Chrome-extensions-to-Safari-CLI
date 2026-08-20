@@ -89,8 +89,9 @@ export interface SigningExpectation {
   wantsTeam: boolean;
   /** The team the build was told to use; absent when detection found none. */
   teamId?: string;
-  /** A team was asked for (`--team auto` / plain `--install`) but none was
-   *  found, so the run announced an ad-hoc fallback and ad-hoc is expected. */
+  /** A team was asked for (`--team auto` / plain `--install`) but the run could not
+   *  use one — none was found, or the one it found could not sign — so it announced
+   *  an ad-hoc fallback and ad-hoc is expected. */
   fellBack?: boolean;
 }
 
@@ -141,8 +142,8 @@ export function signingVerdict(info: SigningInfo | null, want: SigningExpectatio
           ok: true,
           level: "warn",
           message:
-            "Ad-hoc signed — no Apple team was found, so the run fell back as warned. Safari disables the " +
-            'extension every time it quits; keep Develop → "Allow Unsigned Extensions" ticked, or pass ' +
+            "Ad-hoc signed — the run fell back as warned, with no Apple team this Mac can sign with. Safari " +
+            'disables the extension every time it quits; keep Develop → "Allow Unsigned Extensions" ticked, or pass ' +
             "--team <TEAMID> and re-run.",
         }
       : {

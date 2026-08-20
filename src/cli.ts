@@ -156,12 +156,14 @@ OPTIONS
       --team <id>           Sign with an Apple Developer Team ID (real signing → the
                             extension persists across Safari quits; no unsigned toggle).
                             Use --team auto (or plain --install) to auto-detect the team
-                            from Xcode, a provisioning profile, or your signing
-                            certificate; when nothing is found the run warns and falls
-                            back to ad-hoc. The signature is checked against the built
-                            app, so a team that did reach xcodebuild but came out ad-hoc
-                            fails. Omit for ad-hoc signing. Free personal teams expire
-                            ~7 days.
+                            from Xcode's accounts or your signing certificates (the
+                            provisioning profiles on disk pick between them); when
+                            nothing usable is found the run warns and falls back to
+                            ad-hoc. The signature is checked against the built app, so a
+                            team that did reach xcodebuild but came out ad-hoc fails —
+                            except that an auto-detected team unable to sign is rebuilt
+                            ad-hoc rather than failing the run. Omit for ad-hoc signing.
+                            Free personal teams expire ~7 days.
       --no-shim             Do not generate/inject the compatibility shim
       --no-oauth-bridge     Do not wire the Safari OAuth/externally_connectable bridge
       --keep-module         Keep background.type:"module" (default strips it)
@@ -497,10 +499,12 @@ async function main(): Promise<void> {
   const teamRequested = !values.analyze && (values.team !== undefined || Boolean(values.install));
   let team = values.team;
   let teamFallback = false;
+  let teamAutoDetected = false;
   if (!values.analyze && (team === "auto" || (team === undefined && values.install))) {
     const detected = detectXcodeTeam();
     if (detected) {
       team = detected;
+      teamAutoDetected = true;
       info(`Auto-detected Apple Team ID ${detected} → team-signing (persists across Safari quits).`);
     } else {
       teamFallback = true;
@@ -590,6 +594,7 @@ async function main(): Promise<void> {
         installDir: values["install-dir"],
         safariRestart: !values["no-safari-restart"],
         team,
+        teamAutoDetected,
         force: values.force,
         strict: values.strict,
         clean: values.clean,
@@ -616,7 +621,7 @@ async function main(): Promise<void> {
           console.log('  toolbar icon → "Always Allow on Every Website", or Settings → Extensions →');
           console.log("  the extension → Edit Websites.");
         }
-        if (team) {
+        if (team && !result.signedAdHoc) {
           console.log("  Team-signed: stays enabled across Safari quits (no unsigned toggle).");
           console.log("  Free personal team: re-run this command to re-sign before the ~7-day profile expires.");
         } else {
@@ -647,7 +652,13 @@ async function main(): Promise<void> {
       // Safari next quits and drops the extension.
       const signedArtifact = result.installedAppPath ?? result.appPath;
       if (teamRequested && signedArtifact) {
-        if (!verifySigning(signedArtifact, { wantsTeam: team !== undefined, teamId: team, fellBack: teamFallback }))
+        if (
+          !verifySigning(signedArtifact, {
+            wantsTeam: team !== undefined && !result.signedAdHoc,
+            teamId: result.signedAdHoc ? undefined : team,
+            fellBack: teamFallback || Boolean(result.signedAdHoc),
+          })
+        )
           anyFailed = true;
       }
 

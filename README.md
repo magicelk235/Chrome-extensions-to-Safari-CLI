@@ -320,21 +320,27 @@ viaduct ./my-extension.zip --install --team auto # same, explicit
 viaduct ./my-extension.zip --install --team V8K8L3ZSD5  # exact id
 ```
 
-Auto-detection tries three kinds of source in order: the team Xcode cached
-(`IDEProvisioningTeamByIdentifier` or `IDEProvisioningTeams`, in both the
-`com.apple.dt.Xcode` and `com.apple.dt.xcodebuild` domains), any provisioning
-profile already on disk, then a codesigning identity in your keychain. Each one
-covers several layouts, since which preference key gets written, where profiles
-live, and what your certificate is called all vary by Xcode version. The team id
-is all the build needs: xcodebuild runs with `-allowProvisioningUpdates`, so
-Xcode mints the development certificate itself. If nothing turns up a team, the
-run says so and falls back to ad-hoc signing.
+Auto-detection looks at the team Xcode cached (`IDEProvisioningTeamByIdentifier`
+or `IDEProvisioningTeams`, in both the `com.apple.dt.Xcode` and
+`com.apple.dt.xcodebuild` domains) and the codesigning identities in your
+keychain, and uses the provisioning profiles on disk to pick between them, newest
+first, so the team you most recently provisioned for wins when there are several.
+Each source covers a few layouts, since which preference key gets written, where
+profiles live, and what your certificate is called all vary by Xcode version. A
+team id that shows up *only* in a profile is ignored: profiles outlive the account
+that installed them, and handing xcodebuild a team you have no account for fails
+every build. The team id is all the build needs: xcodebuild runs with
+`-allowProvisioningUpdates`, so Xcode mints the development certificate itself. If
+nothing usable turns up, the run says so and falls back to ad-hoc signing.
 
 Signing is not taken on trust. When a team does reach xcodebuild, the signature
 is read back off the built app and checked, so a build that quietly came out
 ad-hoc fails instead of handing you an extension that disappears the next time
 Safari quits. An announced ad-hoc fallback is a warning rather than a failure,
-since you asked for "a team if there is one" and there wasn't one.
+since you asked for "a team if there is one" and there wasn't one. If an
+auto-detected team turns out not to be able to sign, an expired certificate say,
+the build is retried ad-hoc so the conversion still finishes; a team you named
+yourself with `--team <id>` fails instead, since that was a deliberate request.
 
 A free personal Apple team works, but its provisioning profile expires about
 every 7 days, so re-run the command to re-sign. A paid Developer Program account
