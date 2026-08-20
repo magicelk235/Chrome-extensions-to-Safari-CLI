@@ -125,11 +125,11 @@ export function parseSigning(codesignOutput: string): SigningInfo | null {
  */
 export function signingVerdict(info: SigningInfo | null, want: SigningExpectation): SigningVerdict {
   if (!info) {
-    // An unsigned .appex never loads, whether or not a team was in play — the
+    // An unsigned .appex never loads, whether or not a team was in play. The
     // fallback promised ad-hoc signing, not no signature.
     return want.wantsTeam || want.fellBack
       ? { ok: false, level: "fail",
-          message: "The installed extension carries no signature at all — Safari will not load it." }
+          message: "The installed extension carries no signature at all, so Safari will not load it." }
       : { ok: true, level: "warn",
           message: "Could not read the installed extension's signature." };
   }
@@ -142,7 +142,7 @@ export function signingVerdict(info: SigningInfo | null, want: SigningExpectatio
           ok: true,
           level: "warn",
           message:
-            "Ad-hoc signed — the run fell back as warned, with no Apple team this Mac can sign with. Safari " +
+            "Ad-hoc signed. The run fell back as warned, with no Apple team this Mac can sign with. Safari " +
             'disables the extension every time it quits; keep Develop → "Allow Unsigned Extensions" ticked, or pass ' +
             "--team <TEAMID> and re-run.",
         }
@@ -150,7 +150,7 @@ export function signingVerdict(info: SigningInfo | null, want: SigningExpectatio
           ok: true,
           level: "ok",
           message:
-            'Ad-hoc signed, as asked — Safari drops it whenever it quits (keep "Allow Unsigned Extensions" on, or re-run with --team).',
+            'Ad-hoc signed, as asked. Safari drops it whenever it quits (keep "Allow Unsigned Extensions" on, or re-run with --team).',
         };
   }
   if (info.adhoc || !info.teamId) {
@@ -159,7 +159,7 @@ export function signingVerdict(info: SigningInfo | null, want: SigningExpectatio
       level: "fail",
       message:
         `Team ${want.teamId ?? "signing"} was requested and reached xcodebuild, but the installed extension is ` +
-        "ad-hoc — Safari disables it every time it quits. The build dropped the identity: check that an " +
+        "ad-hoc, so Safari disables it every time it quits. The build dropped the identity: check that an " +
         '"Apple Development" certificate for that team is in your keychain (Xcode → Settings → Accounts → ' +
         "Manage Certificates → +), then re-run.",
     };
@@ -171,7 +171,7 @@ export function signingVerdict(info: SigningInfo | null, want: SigningExpectatio
       message: `Installed extension is signed with team ${info.teamId}, not the requested ${want.teamId}.`,
     };
   }
-  return { ok: true, level: "ok", message: `Team-signed (${info.teamId}) — survives Safari quitting.` };
+  return { ok: true, level: "ok", message: `Team-signed (${info.teamId}), so it survives Safari quitting.` };
 }
 
 /** The bundle Safari actually loads: the .appex inside the built app. */

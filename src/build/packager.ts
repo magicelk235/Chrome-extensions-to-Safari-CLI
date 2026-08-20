@@ -256,7 +256,7 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling, URLSessio
         if let reply = Self.brokerCall(env) {
             self.reply(context, reply)
         } else {
-            self.reply(context, ["error": "native-messaging broker unavailable — open the extension's app", "closed": true])
+            self.reply(context, ["error": "native-messaging broker unavailable; open the extension's app", "closed": true])
         }
     }
 
@@ -997,7 +997,7 @@ export function buildXcodeProject(
   // its signing expectation and tells the user about the unsigned toggle.
   if (!team || !opts.teamAutoDetected || !first.signingFailure) return null;
   warn(
-    `Team ${team} cannot sign on this Mac (see the error above) — rebuilding ad-hoc so the conversion still produces an app.\n` +
+    `Team ${team} cannot sign on this Mac (see the error above). Rebuilding ad-hoc so the conversion still produces an app.\n` +
       "  Ad-hoc extensions need Safari → Develop → \"Allow Unsigned Extensions\" re-ticked after every Safari restart.\n" +
       "  To get a team-signed build, sign in to Xcode → Settings → Accounts, then re-run.",
   );

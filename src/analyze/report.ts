@@ -83,7 +83,7 @@ const LABEL: Record<Severity, string> = { error: "ERROR", warning: "WARN", info:
 const HUE: Record<Severity, "red" | "yellow" | "blue"> = { error: "red", warning: "yellow", info: "blue" };
 
 // When `strict` is provided, append a convertible/blocking verdict line matching the
-// markdown report and the exit code — so `--analyze` terminal output agrees with both
+// markdown report and the exit code, so `--analyze` terminal output agrees with both
 // and --strict has a visible effect. Omit it (mid-pipeline convert calls) for no verdict.
 export function printIssues(issues: Issue[], strict?: boolean): void {
   const verdict = () => {
@@ -91,8 +91,8 @@ export function printIssues(issues: Issue[], strict?: boolean): void {
     const blocking = countBlocking(issues, strict);
     console.log(
       blocking === 0
-        ? color("green", "\n✅ Convertible — no blocking issues.")
-        : color("red", `\n⛔ ${blocking} blocking issue(s)${strict ? " (--strict: warnings count as blocking)" : ""}.`),
+        ? color("green", "\nConvertible: no blocking issues.")
+        : color("red", `\n${blocking} blocking issue(s)${strict ? " (--strict: warnings count as blocking)" : ""}.`),
     );
   };
   if (issues.length === 0) {
@@ -179,19 +179,19 @@ export function buildReportMarkdown(meta: ReportMeta, issues: Issue[]): string {
   // includes promoted warnings, so calling them all "error(s)" contradicts the
   // per-severity counts a few lines below.
   const status = blocking === 0
-    ? "✅ Convertible — no blocking issues"
-    : `⛔ ${blocking} blocking issue(s)${meta.strict ? " (--strict: warnings count as blocking)" : ""} — use --force to convert anyway`;
+    ? "Convertible, no blocking issues"
+    : `${blocking} blocking issue(s)${meta.strict ? " (--strict: warnings count as blocking)" : ""}. Use --force to convert anyway`;
 
   const lines: string[] = [
-    `# Conversion report — ${meta.name}`,
+    `# Conversion report: ${meta.name}`,
     "",
     `- Status: ${status}`,
     `- Version: ${meta.version ?? "(none)"}`,
     `- Manifest: MV${meta.manifestVersion}`,
     `- Platforms: ${meta.platforms}`,
     `- Issues: ${counts.error} error(s), ${counts.warning} warning(s), ${counts.info} info` +
-      (autoFixed ? ` — ${autoFixed} auto-fixed` : "") +
-      (shimmed ? ` — ${shimmed} shimmed` : ""),
+      (autoFixed ? `, ${autoFixed} auto-fixed` : "") +
+      (shimmed ? `, ${shimmed} shimmed` : ""),
     "",
   ];
 
@@ -213,8 +213,8 @@ export function buildReportMarkdown(meta: ReportMeta, issues: Issue[]): string {
     lines.push(`## ${HEADING[sev]} (${group.length})`, "");
     for (const i of group) {
       const loc = i.file ? ` \`${i.file}${i.line ? `:${i.line}` : ""}\`` : "";
-      const tag = i.shimmed ? " _(shimmed — handled at runtime)_" : i.autoFixed ? " _(auto-fixed)_" : "";
-      lines.push(`- **[${i.category}]**${loc}${tag} — ${i.message}`);
+      const tag = i.shimmed ? " _(shimmed, handled at runtime)_" : i.autoFixed ? " _(auto-fixed)_" : "";
+      lines.push(`- **[${i.category}]**${loc}${tag}: ${i.message}`);
       if (i.fix) lines.push(`  - ${i.autoFixed ? "" : "fix: "}${i.fix}`);
     }
     lines.push("");

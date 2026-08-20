@@ -326,7 +326,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       issues.push({
         severity: "warning",
         category: "icons",
-        message: `Icon "${p}" is ${ext} — Safari only renders PNG icons (Chrome accepts more formats).`,
+        message: `Icon "${p}" is ${ext}; Safari only renders PNG icons (Chrome accepts more formats).`,
         file: "manifest.json",
         fix: "Convert the icon to PNG and update the manifest path.",
       });
@@ -469,9 +469,9 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         severity: "error",
         category: "content-blocker",
         message:
-          "This is a content blocker built on blocking webRequest — network blocking will NOT work in Safari (WebKit decides each request before extension JS runs and ignores the blocking return). The extension still installs and its cosmetic/element-hiding features still run.",
+          "This is a content blocker built on blocking webRequest, and network blocking will NOT work in Safari (WebKit decides each request before extension JS runs and ignores the blocking return). The extension still installs and its cosmetic/element-hiding features still run.",
         file: "manifest.json",
-        fix: "Blocking webRequest cannot block in Safari and no shim can change that. For real ad/tracker blocking, convert the extension's declarativeNetRequest build instead — e.g. uBlock Origin Lite (uBOL), which Safari honors.",
+        fix: "Blocking webRequest cannot block in Safari and no shim can change that. For real ad/tracker blocking, convert the extension's declarativeNetRequest build instead, such as uBlock Origin Lite (uBOL), which Safari honors.",
       });
     }
   }

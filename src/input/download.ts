@@ -39,19 +39,30 @@ export function extractStoreId(url: string): string | undefined {
   return undefined;
 }
 
-// Google's CRX endpoint gates responses on prodversion; too stale a value risks it
-// declining newer extensions. Keep this within a major or two of current Chrome stable.
-// Override via VIADUCT_CRX_PRODVERSION when the default goes stale and the endpoint declines.
+// Google's CRX endpoint gates responses on prodversion: an extension whose
+// minimum_chrome_version is newer than the version we claim gets declined with a
+// 204 and an empty body, not an error. Chrome majors move every few weeks, so any
+// value here goes stale. Ask as current-ish stable first, then retry as a version
+// nothing can gate past. Override the first claim with VIADUCT_CRX_PRODVERSION.
 const CRX_PRODVERSION = process.env.VIADUCT_CRX_PRODVERSION || "138.0";
+const CRX_PRODVERSION_MAX = "9999.0";
 
 /** Build the clients2 CRX download endpoint (302-redirects to the real CRX). */
-export function crxEndpoint(id: string): string {
+export function crxEndpoint(id: string, prodversion = CRX_PRODVERSION): string {
   const x = `id=${id}&installsource=ondemand&uc`;
   return (
     "https://clients2.google.com/service/update2/crx" +
-    `?response=redirect&acceptformat=crx2,crx3&prodversion=${CRX_PRODVERSION}` +
+    `?response=redirect&acceptformat=crx2,crx3&prodversion=${prodversion}` +
     `&x=${encodeURIComponent(x)}`
   );
+}
+
+/** Store endpoints to try in order: the configured Chrome version, then the
+ * maximum. One entry when they coincide (the user pinned it that high). */
+export function storeEndpoints(id: string): string[] {
+  const urls = [crxEndpoint(id)];
+  if (CRX_PRODVERSION !== CRX_PRODVERSION_MAX) urls.push(crxEndpoint(id, CRX_PRODVERSION_MAX));
+  return urls;
 }
 
 interface HttpResult {
@@ -180,41 +191,50 @@ function inferKind(buf: Buffer, url: string, contentType = ""): "crx" | "zip" {
   );
 }
 
+function save(buffer: Buffer, url: string, contentType: string, scratchDir: string): string {
+  const kind = inferKind(buffer, url, contentType);
+  const dest = join(scratchDir, `download.${kind}`);
+  writeFileSync(dest, buffer);
+  return dest;
+}
+
 /**
  * Download an extension from a Chrome Web Store URL or a direct .crx/.zip URL.
  * Returns the local path to the saved archive (for extractExtension).
  */
 export async function downloadExtension(url: string, scratchDir: string): Promise<string> {
   const storeId = extractStoreId(url);
-  let fetchUrl = url;
-  if (storeId) {
-    fetchUrl = crxEndpoint(storeId);
-  } else if (/chromewebstore\.google\.com|chrome\.google\.com\/webstore/i.test(url)) {
+  if (storeId) return downloadFromStore(storeId, scratchDir);
+  if (/chromewebstore\.google\.com|chrome\.google\.com\/webstore/i.test(url)) {
     throw new Error(
       `Could not find a 32-char extension ID in the store URL.\n` +
         `Expected something like https://chromewebstore.google.com/detail/<name>/<id>`,
     );
   }
 
-  const { buffer, contentType } = await httpGet(fetchUrl);
-  // Google's CRX endpoint answers 204/empty for extensions it won't serve on
-  // demand (often the largest or policy-gated ones). httpGet treats that as a
-  // successful empty body; without this guard inferKind falls back to the URL
-  // suffix, an empty file is written, and the user hits a baffling "bad magic"
-  // error deep in the extractor. Fail here with an actionable message instead.
-  // A real CRX/ZIP is always larger than its magic header.
+  const { buffer, contentType } = await httpGet(url);
+  // A real CRX/ZIP is always larger than its magic header. Without this guard
+  // inferKind falls back to the URL suffix, an empty file is written, and the
+  // user hits a baffling "bad magic" error deep in the extractor.
   if (buffer.length < 4) {
-    if (storeId) {
-      throw new Error(
-        `The Chrome Web Store returned no downloadable package for extension ${storeId} ` +
-          `(the on-demand CRX endpoint declined it — common for very large or policy-gated extensions).\n` +
-          `Download the .crx manually and pass the local file path instead.`,
-      );
-    }
     throw new Error(`Downloaded an empty response from ${url} (no extension package returned).`);
   }
-  const kind = inferKind(buffer, storeId ? "" : url, contentType);
-  const dest = join(scratchDir, `download.${kind}`);
-  writeFileSync(dest, buffer);
-  return dest;
+  return save(buffer, url, contentType, scratchDir);
+}
+
+/** Fetch a store extension by ID, claiming a newer Chrome on each attempt. The
+ * endpoint answers 204 with an empty body (not an error) when it won't serve the
+ * extension to the Chrome version we claimed, so an empty body means retry. */
+async function downloadFromStore(id: string, scratchDir: string): Promise<string> {
+  for (const endpoint of storeEndpoints(id)) {
+    const { buffer, contentType } = await httpGet(endpoint);
+    // Store downloads have no trustworthy suffix, so pass "": magic bytes decide.
+    if (buffer.length >= 4) return save(buffer, "", contentType, scratchDir);
+  }
+  throw new Error(
+    `The Chrome Web Store returned no downloadable package for extension ${id} ` +
+      `(the on-demand CRX endpoint declined it, which happens for delisted, region-blocked ` +
+      `or policy-gated extensions).\n` +
+      `Download the .crx manually and pass the local file path instead.`,
+  );
 }

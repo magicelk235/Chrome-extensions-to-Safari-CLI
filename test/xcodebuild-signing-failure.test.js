@@ -129,10 +129,10 @@ test("an auto-detected team that cannot sign falls back to an ad-hoc build", () 
   assert.ok(result, "the run produced no app at all");
   assert.equal(result.adHocFallback, true);
   assert.match(result.builtApp, /App\.app$/);
-  // The cause is on screen before the fallback notice — the user has to be able to
+  // The cause is on screen before the fallback notice: the user has to be able to
   // tell why they got an ad-hoc build.
   assert.match(printed, /No Account for Team "UBF8T346G9"/);
-  assert.match(printed, /rebuilding ad-hoc/);
+  assert.match(printed, /Rebuilding ad-hoc/);
   assert.deepEqual(attempts, ["attempt team='UBF8T346G9'", "attempt team=''"]);
 });
 

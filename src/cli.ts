@@ -121,7 +121,7 @@ const SAFARI_VERSION_RE = /^\d+(\.\d+){0,2}$/;
 // Apple Developer Team IDs are exactly 10 uppercase alphanumeric characters.
 const TEAM_ID_RE = /^[A-Z0-9]{10}$/;
 
-const HELP = `viaduct — convert a Chrome extension to a Safari Web Extension
+const HELP = `viaduct: convert a Chrome extension to a Safari Web Extension
 
 USAGE
   viaduct <input> [options]
@@ -153,17 +153,17 @@ OPTIONS
       --verify              After --install, check Safari registered/enabled the extension
       --install-dir <dir>   Install target directory (default: ~/Applications)
       --no-safari-restart   With --install, don't quit/relaunch Safari or set the unsigned toggle
-      --team <id>           Sign with an Apple Developer Team ID (real signing → the
-                            extension persists across Safari quits; no unsigned toggle).
+      --team <id>           Sign with an Apple Developer Team ID. Real signing keeps the
+                            extension enabled across Safari quits, with no unsigned toggle.
                             Use --team auto (or plain --install) to auto-detect the team
                             from Xcode's accounts or your signing certificates (the
                             provisioning profiles on disk pick between them); when
                             nothing usable is found the run warns and falls back to
                             ad-hoc. The signature is checked against the built app, so a
-                            team that did reach xcodebuild but came out ad-hoc fails —
-                            except that an auto-detected team unable to sign is rebuilt
-                            ad-hoc rather than failing the run. Omit for ad-hoc signing.
-                            Free personal teams expire ~7 days.
+                            team that did reach xcodebuild but came out ad-hoc fails.
+                            The one exception: an auto-detected team that cannot sign is
+                            rebuilt ad-hoc rather than failing the run. Omit for ad-hoc
+                            signing. Free personal teams expire after about 7 days.
       --no-shim             Do not generate/inject the compatibility shim
       --no-oauth-bridge     Do not wire the Safari OAuth/externally_connectable bridge
       --keep-module         Keep background.type:"module" (default strips it)
@@ -203,7 +203,7 @@ function doctor(): number {
   for (const [name, fn, hint] of checks) {
     if (fn()) ok(name);
     else {
-      fail(`${name} — ${hint}`);
+      fail(hint ? `${name}: ${hint}` : name);
       allOk = false;
     }
   }
@@ -435,7 +435,7 @@ async function main(): Promise<void> {
   }
 
   if (values["min-safari"] !== undefined && !SAFARI_VERSION_RE.test(values["min-safari"])) {
-    fail(`Invalid --min-safari "${values["min-safari"]}". Use a version like 15.4 or 18.4 (1–3 numbers).`);
+    fail(`Invalid --min-safari "${values["min-safari"]}". Use a version like 15.4 or 18.4 (1 to 3 numbers).`);
     process.exit(2);
   }
 
@@ -616,8 +616,8 @@ async function main(): Promise<void> {
         console.log(`  Installed: ${result.installedAppPath}`);
         console.log("  Safari → Settings → Extensions → enable the extension.");
         if (result.needsWebsiteAccessGrant) {
-          console.log("  Then grant website access (Safari defaults to Ask — until allowed, content");
-          console.log("  scripts and external API calls silently do nothing): click the extension's");
+          console.log("  Then grant website access. Safari defaults to Ask, and until you allow it,");
+          console.log("  content scripts and external API calls silently do nothing: click the extension's");
           console.log('  toolbar icon → "Always Allow on Every Website", or Settings → Extensions →');
           console.log("  the extension → Edit Websites.");
         }
@@ -632,7 +632,7 @@ async function main(): Promise<void> {
         console.log(`  Install: re-run with --install, or  cp -R "${result.appPath}" ~/Applications/`);
         console.log("  Then: Safari → Settings → Extensions → enable.");
         if (result.needsWebsiteAccessGrant) {
-          console.log('  And grant website access (toolbar icon → "Always Allow on Every Website") — Safari defaults to Ask.');
+          console.log('  And grant website access (toolbar icon → "Always Allow on Every Website"). Safari defaults to Ask.');
         }
       } else if (result.xcodeProject) {
         console.log(`  Project: ${result.xcodeProject}`);

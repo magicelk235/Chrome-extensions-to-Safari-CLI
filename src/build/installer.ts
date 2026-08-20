@@ -96,7 +96,7 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   // the entitlements and Safari would stop registering the appex.
   const reg = run(LSREGISTER, ["-f", dest]);
   if (reg.code === 0) ok("Registered with LaunchServices");
-  else warn(`lsregister exit ${reg.code} — Safari may take a moment to see the app.`);
+  else warn(`lsregister exit ${reg.code}; Safari may take a moment to see the app.`);
 
   // A team-signed extension loads without the (session-scoped) unsigned toggle, so skip
   // the whole Safari quit/toggle/relaunch dance when signed.
@@ -296,7 +296,7 @@ export function installBrokerAgent(appPath: string, bundleId: string): boolean {
       return false;
     }
   }
-  ok(`Broker LaunchAgent installed (${label}) — keeps native messaging alive across restarts.`);
+  ok(`Broker LaunchAgent installed (${label}); native messaging stays alive across restarts.`);
   return true;
 }
 

@@ -22,7 +22,7 @@ Staged extension: ${stagedDir}
 
 Notes:
 - Temporary extensions must be re-added after each Safari restart.
-- No code signing or Xcode build required — ideal for rapid iteration.
+- Nothing is code-signed and Xcode never runs, so a re-stage is quick.
 `;
   const p = join(dirname(stagedDir), "SAFARI_LOAD_INSTRUCTIONS.md");
   writeFileSync(p, body, "utf-8");

@@ -255,7 +255,7 @@ export const UNSUPPORTED_APIS: Record<
   },
   "chrome.readingList": {
     severity: "info",
-    message: "chrome.readingList is emulated (add/remove/update/query + events) over an extension-private store — NOT the user's native Safari Reading List (no API exists).",
+    message: "chrome.readingList is emulated (add/remove/update/query + events) over an extension-private store, NOT the user's native Safari Reading List (no API exists).",
     fix: "No action needed if you manage your own list; you cannot read/write Safari's native Reading List.",
   },
   "chrome.sessions": {
@@ -280,7 +280,7 @@ export const UNSUPPORTED_APIS: Record<
   },
   "chrome.userScripts": {
     severity: "warning",
-    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip), but the scripts are NOT actually injected — WebKit has no dynamic user-world API.",
+    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip), but the scripts are NOT actually injected, because WebKit has no dynamic user-world API.",
     fix: "For real injection, statically declare content scripts or use chrome.scripting.",
   },
   "chrome.idle": {
@@ -290,12 +290,12 @@ export const UNSUPPORTED_APIS: Record<
   },
   "chrome.instanceID": {
     severity: "info",
-    message: "chrome.instanceID: getID/getCreationTime/deleteID work (stable persisted ID); getToken/deleteToken (FCM push) still reject — no Safari surface.",
+    message: "chrome.instanceID: getID/getCreationTime/deleteID work (stable persisted ID); getToken/deleteToken (FCM push) still reject, since there is no Safari surface for them.",
     fix: "For push, use APNs via the native host or poll with chrome.alarms.",
   },
   "chrome.bookmarks": {
     severity: "info",
-    message: "chrome.bookmarks is fully emulated (CRUD/search/events) over an extension-private store in storage.local — NOT the user's Safari bookmarks (no API exists for those).",
+    message: "chrome.bookmarks is fully emulated (CRUD/search/events) over an extension-private store in storage.local, NOT the user's Safari bookmarks (no API exists for those).",
     fix: "No action needed if you manage your own bookmark data; you cannot read/write the user's real Safari bookmarks.",
   },
   "chrome.history": {

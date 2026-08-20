@@ -84,7 +84,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
     if (safe.length !== rules.length) {
       writeFileSync(file, JSON.stringify(safe, null, 2) + "\n", "utf-8");
       notes.push(
-        `Stripped ${rules.length - safe.length} modifyHeaders rule(s) from DNR ruleset "${id}" — ` +
+        `Stripped ${rules.length - safe.length} modifyHeaders rule(s) from DNR ruleset "${id}": ` +
           "modifyHeaders crashes Safari's DNR rule store; other rules kept."
       );
     }
@@ -114,10 +114,10 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
     ];
     const nmNote = allPerms.includes("nativeMessaging")
       ? "Requires the nativeMessaging permission (present here)."
-      : "Requires the nativeMessaging permission (NOT declared here — add it or the retry cannot reach the native host).";
+      : "Requires the nativeMessaging permission (NOT declared here; add it or the retry cannot reach the native host).";
     notes.push(
       "api.anthropic.com calls hit an org CORS gate that cannot be bypassed in-browser " +
-        "(no DNR modifyHeaders — it crashes Safari). The shim now retries blocked backend " +
+        "(no DNR modifyHeaders, which crashes Safari). The shim now retries blocked backend " +
         "requests through the native host (SafariWebExtensionHandler), which sets the Chrome " +
         `Origin server-side. ${nmNote}`
     );

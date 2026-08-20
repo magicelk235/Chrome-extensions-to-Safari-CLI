@@ -129,7 +129,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     info("Staging clean extension assets …");
     const droppedAssets = stageExtension(extPath, stageDir, collectReferencedPaths(manifest));
     for (const a of droppedAssets) {
-      warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${a} — it will 404 in Safari.`);
+      warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${a}. It will 404 in Safari.`);
     }
 
     // Safari's chrome.scripting is an immutable host slot — the shim can't add the
@@ -243,7 +243,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // hotkey can't be wired.
     const hotkey = wireActionHotkey(stageDir, transformed);
     if (hotkey) {
-      ok(`Action hotkey: ${hotkey} toggles the extension in-page (popover-free — the toolbar button stays inert to avoid Safari's un-closable popover)`);
+      ok(`Action hotkey: ${hotkey} toggles the extension in-page. The toolbar button stays inert on purpose, to avoid Safari's un-closable popover.`);
     } else if (wireActionClickBridge(stageDir, transformed)) {
       ok("Action-click bridge: synthetic popup replays action.onClicked (Safari won't fire it on the toolbar button; shows a brief popover)");
     }
@@ -273,7 +273,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     }
 
     const synthIcons = synthesizePlaceholderIcons(stageDir, transformed, appName);
-    if (synthIcons.length > 0) ok(`Synthesized placeholder icons (${synthIcons.join("/")}px) — manifest had none`);
+    if (synthIcons.length > 0) ok(`Synthesized placeholder icons (${synthIcons.join("/")}px); the manifest had none`);
 
     const strippedMaps = stripDanglingSourcemaps(stageDir);
     if (strippedMaps > 0) ok(`Stripped dangling sourcemap refs from ${strippedMaps} script(s)`);
@@ -287,7 +287,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     const raisedFrom = raiseMinVersionForMainWorld(transformed, mainWorld);
     if (raisedFrom) {
       const line = `Safari strict_min_version ${raisedFrom} → ${MAIN_WORLD_MIN_SAFARI_VERSION} (required by the world:"MAIN" content script(s) this conversion injected: ${mainWorld.join(", ")})`;
-      if (opts.minSafariVersion) warn(line + ` — overrides --min-safari ${opts.minSafariVersion}`);
+      if (opts.minSafariVersion) warn(line + `. This overrides --min-safari ${opts.minSafariVersion}`);
       else ok(line);
     }
 
@@ -442,10 +442,10 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // The check v2 lacked: confirm the COMPILED bundle ids match intent (before it moves).
     const v = verifyBuiltBundleId(builtApp, bundleId);
     if (!v.ok) {
-      fail("Bundle identifier mismatch in the built app — Safari would register the wrong extension.");
-      console.error(`    app  expected ${v.expectedAppId}  got ${v.appId ?? "∅"}`);
-      console.error(`    appex expected ${v.expectedExtId} got ${v.extId ?? "∅"}`);
-      console.error("    This is the exact failure mode of the previous attempt. Aborting as failed.");
+      fail("Bundle identifier mismatch in the built app: Safari would register the wrong extension.");
+      console.error(`    app  expected ${v.expectedAppId}  got ${v.appId ?? "(none)"}`);
+      console.error(`    appex expected ${v.expectedExtId} got ${v.extId ?? "(none)"}`);
+      console.error("    Aborting instead of shipping an app Safari would register wrongly.");
       printIssues(issues);
       return result;
     }
@@ -458,7 +458,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
     if (!team) {
       const allowed = unsignedExtensionsAllowed();
       if (allowed === false) {
-        warn('Safari "Allow Unsigned Extensions" is OFF — enable it (Develop menu) or the extension will not load.');
+        warn('Safari "Allow Unsigned Extensions" is OFF. Enable it in the Develop menu, or the extension will not load.');
       } else if (allowed === null) {
         warn('Could not read Safari "Allow Unsigned Extensions"; enable it manually for ad-hoc builds.');
       }
