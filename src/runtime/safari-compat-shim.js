@@ -6076,6 +6076,121 @@ var __C2S_DEBUG__ = false;
     } catch (e) {}
   })();
 
+  // ── one session store for the whole extension ────────────────────────────
+    // Chrome keeps storage.session in the BROWSER: every extension context reads and
+    // writes one map, and it outlives a service-worker restart. Safari gives each
+    // context its own space (Apple's own developer-forum answer, and measured behavior),
+    // which quietly breaks the ordinary MV3 pattern of holding state the background owns
+    // and letting a panel read it:
+    //
+    //   const r = await chrome.runtime.sendMessage({type:"check_and_refresh_oauth"});
+    //   if (r?.isValid) return chrome.storage.session.get("accessToken");   // panel
+    //
+    // The background answers "valid", the panel then reads its OWN empty space, finds
+    // nothing, and shows a login screen. Live on Claude for Chrome, which migrates its
+    // OAuth tokens into session storage on purpose so they never reach disk.
+    //
+    // So give the extension one owner. The background page keeps using the native store;
+    // every other extension context forwards get/set/remove/clear to it over runtime
+    // messaging, which on an extension page is the shim's own storage relay and therefore
+    // works. The values stay wherever Safari puts the background's session data, so this
+    // buys Chrome's sharing semantics without persisting anything the extension chose to
+    // keep out of storage.local.
+    (function () {
+      var proto = "";
+      try { proto = (typeof location !== "undefined" && location.protocol) || ""; } catch (e) {}
+      if (!/^(safari-web-extension|chrome-extension|moz-extension):$/.test(proto)) return; // pages only
+      var s = null;
+      try { s = chrome.storage && chrome.storage.session; } catch (e) {}
+      if (!s) return;
+      // Only when session is its own object. A host that hands out one object for every
+      // area would have this proxy patching storage.local as well, and since the
+      // forwarding message travels over the relay's storage.local mailbox, the first read
+      // would call itself until the stack ran out.
+      try {
+        if (s === chrome.storage.local || s === chrome.storage.sync) return;
+      } catch (e) { return; }
+      var CH = "__c2sSessionStore";
+      var isBg = /background\.html$/.test((typeof location !== "undefined" && location.pathname) || "");
+
+      if (isBg) {
+        // Owner side: answer for the native store. Registered AFTER the storage relay
+        // installs, because the relay mirrors mailbox records only into listeners it
+        // recorded itself: a listener added earlier reaches the native event alone, and
+        // a relayed request from another page would never see it.
+        try {
+          chrome.runtime.onMessage.addListener(function (msg, sender, respond) {
+            if (!msg || msg.__c2sSess !== CH) return;
+            var op = msg.op, arg = msg.arg;
+            return new Promise(function (resolve) {
+              var done = function (v) { try { respond({ v: v }); } catch (e) {} resolve({ v: v }); };
+              try {
+                if (op === "get") {
+                  var r = s.get(arg, function (o) { done(o || {}); });
+                  if (r && typeof r.then === "function") r.then(function (o) { done(o || {}); }, function () { done({}); });
+                } else if (op === "set" || op === "remove") {
+                  var w = s[op](arg, function () { done(true); });
+                  if (w && typeof w.then === "function") w.then(function () { done(true); }, function () { done(false); });
+                } else if (op === "clear") {
+                  var c = s.clear(function () { done(true); });
+                  if (c && typeof c.then === "function") c.then(function () { done(true); }, function () { done(false); });
+                } else done(undefined);
+              } catch (e) { done(undefined); }
+            });
+          });
+        } catch (e) {}
+        return;
+      }
+
+      // Reader side: ask the owner, and fall back to the local space when it cannot be
+      // reached, so this is never worse than the behavior it replaces.
+      var ask = function (op, arg) {
+        return new Promise(function (resolve) {
+          var settled = false;
+          var done = function (v) { if (!settled) { settled = true; resolve(v); } };
+          setTimeout(function () { done(undefined); }, 3000);
+          try {
+            var r = chrome.runtime.sendMessage({ __c2sSess: CH, op: op, arg: arg }, function (res) {
+              done(res && "v" in res ? res.v : undefined);
+            });
+            if (r && typeof r.then === "function") {
+              r.then(function (res) { done(res && "v" in res ? res.v : undefined); }, function () { done(undefined); });
+            }
+          } catch (e) { done(undefined); }
+        });
+      };
+      var native = {};
+      for (var k in { get: 1, set: 1, remove: 1, clear: 1 }) {
+        try { if (typeof s[k] === "function") native[k] = s[k].bind(s); } catch (e) {}
+      }
+      var proxied = {};
+      var wrap = function (op, empty) {
+        return function (arg, cb) {
+          if (typeof arg === "function") { cb = arg; arg = null; }
+          var p = ask(op, arg === undefined ? null : arg).then(function (v) {
+            if (v !== undefined) return v;
+            // Owner unreachable: use this context's own store rather than nothing.
+            return new Promise(function (res) {
+              try {
+                if (!native[op]) return res(empty);
+                var r = native[op](arg, function (o) { res(op === "get" ? (o || empty) : empty); });
+                if (r && typeof r.then === "function") r.then(function (o) { res(op === "get" ? (o || empty) : empty); }, function () { res(empty); });
+              } catch (e) { res(empty); }
+            });
+          });
+          if (typeof cb === "function") { p.then(function (v) { try { cb(v); } catch (e) {} }); return undefined; }
+          return p;
+        };
+      };
+      proxied.get = wrap("get", {});
+      proxied.set = wrap("set", undefined);
+      proxied.remove = wrap("remove", undefined);
+      proxied.clear = wrap("clear", undefined);
+      var target = mutableNamespace(chrome.storage, "session");
+      if (!target) return;
+      for (var op in proxied) installOverride(target, op, proxied[op]);
+    })();
+
   // api.anthropic.com requires the "anthropic-dangerous-direct-browser-access"
   // header on every browser-origin request; the SDK adds it to /v1/messages but
   // some hand-written fetches (e.g. /api/oauth/account/settings) omit it, giving

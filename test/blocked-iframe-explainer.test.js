@@ -33,9 +33,15 @@ function extensionPage() {
     onMessage: { addListener() {}, removeListener() {}, hasListener: () => false },
     onConnect: { addListener() {}, removeListener() {}, hasListener: () => false },
   };
+  const mkArea = () => ({
+    get: (_k, cb) => { if (typeof cb === "function") cb({}); return Promise.resolve({}); },
+    set: (_o, cb) => { if (typeof cb === "function") cb(); return Promise.resolve(); },
+    remove: (_k, cb) => { if (typeof cb === "function") cb(); return Promise.resolve(); },
+    clear: (cb) => { if (typeof cb === "function") cb(); return Promise.resolve(); },
+  });
   const chrome = {
     runtime,
-    storage: { local: area, sync: area, session: area, onChanged: { addListener() {}, removeListener() {} } },
+    storage: { local: mkArea(), sync: mkArea(), session: mkArea(), onChanged: { addListener() {}, removeListener() {} } },
     tabs: { query: () => Promise.resolve([]), onUpdated: { addListener() {} }, onRemoved: { addListener() {} }, onActivated: { addListener() {} } },
     windows: { onFocusChanged: { addListener() {} }, getAll: () => Promise.resolve([]) },
     alarms: { create() {}, onAlarm: { addListener() {} } },
