@@ -57,8 +57,99 @@
     return u;
   }
 
+  // An auth flow's outcome has to be readable AFTER the fact. The failures that matter
+  // here only happen once Safari has torn the background page down, and holding a Web
+  // Inspector on that page keeps it alive, so the console cannot observe them without
+  // preventing them. Keep the last few outcomes in storage.local instead, which is the
+  // same trick [[Testing and Debugging]] recommends for the extension's own boot.
+  //
+  // Outcomes only: whether the flow was silent, whether it redirected, the reason it did
+  // not, how long it took, and which navigations the auth tab reported (scheme+host+path,
+  // never the query or fragment, which is where the code and the token ride).
+  var AUTH_LOG_KEY = "__c2sAuthLog";
+  function recordOutcome(interactive, ok, reason, ms, navs) {
+    try {
+      var entry = { t: Date.now(), silent: !interactive, ok: !!ok, reason: String(reason).slice(0, 120), ms: ms, navs: navs || [] };
+      var store = api.storage && api.storage.local;
+      if (!store) return;
+      store.get(AUTH_LOG_KEY, function (o) {
+        var log = (o && o[AUTH_LOG_KEY]) || [];
+        if (!Array.isArray(log)) log = [];
+        log.push(entry);
+        while (log.length > 20) log.shift();
+        var w = {};
+        w[AUTH_LOG_KEY] = log;
+        try { store.set(w); } catch (e) {}
+      });
+    } catch (e) {}
+  }
+
+  // ── watching the auth tab ────────────────────────────────────────────────
+  // Safari does not deliver webNavigation events to a listener added AFTER the
+  // background page finished evaluating. A flow that opened its tab and then attached
+  // its own listeners therefore saw NOTHING: measured on Safari 18 with the background
+  // page provably alive (a 2s heartbeat kept ticking), every silent attempt ended with
+  // an empty navigation list and "tab never navigated", so the redirect carrying the
+  // OAuth code went by unseen. For a bundle whose tokens live in storage.session —
+  // cleared when Safari quits — that silent re-auth IS the thing that keeps the user
+  // signed in, so the whole login looked like it never persisted.
+  //
+  // So register the observers once, here at load, and route each event to whichever
+  // flow owns the tab. Three sources feed the same router because Safari's coverage
+  // varies by version and by whether the tab is in the foreground: webNavigation,
+  // tabs.onUpdated, and a poll of tabs.get inside the flow. The first one to report
+  // the redirect wins; the others are then a no-op.
+  var authTabs = {};
+  function routeNav(ev, tabId, frameId, url) {
+    // Top-level frame only. Chrome's launchWebAuthFlow watches its own auth window's
+    // main frame; without this check a sub-iframe navigating to a URL that starts with
+    // the redirect target could resolve the flow with a frame-controlled URL, which the
+    // caller then parses for the code.
+    if (frameId !== undefined && frameId !== 0) return;
+    var fn = authTabs[tabId];
+    if (fn) fn(ev, url);
+  }
+  (function () {
+    var wire = function (event, ev) {
+      try {
+        if (event && typeof event.addListener === "function") {
+          event.addListener(function (d) { if (d && d.url) routeNav(ev, d.tabId, d.frameId, d.url); });
+        }
+      } catch (e) {}
+    };
+    var wn = api.webNavigation;
+    if (wn) {
+      wire(wn.onBeforeNavigate, "before");
+      wire(wn.onCommitted, "commit");
+      wire(wn.onErrorOccurred, "error");
+      wire(wn.onCompleted, "loaded");
+    }
+    try {
+      if (api.tabs && api.tabs.onUpdated) {
+        api.tabs.onUpdated.addListener(function (tabId, info, tab) {
+          var u = (info && info.url) || (tab && tab.url);
+          if (u) routeNav(info && info.status === "complete" ? "loaded" : "updated", tabId, 0, u);
+        });
+      }
+      if (api.tabs && api.tabs.onRemoved) {
+        api.tabs.onRemoved.addListener(function (tabId) { routeNav("closed", tabId, 0, ""); });
+      }
+    } catch (e) {}
+  })();
+
   function launchWebAuthFlow(details, callback) {
     DBG("[idpoly] launchWebAuthFlow", JSON.stringify(details));
+    var startedAt = Date.now();
+    // Which navigations the auth tab reported, for the log above. Query and fragment are
+    // dropped, since that is where the code and the token ride.
+    var navTrace = [];
+    function note(ev, url) {
+      if (navTrace.length >= 14) return;
+      var where;
+      try { var u = new URL(url); where = u.protocol + "//" + u.host + u.pathname; }
+      catch (e) { where = String(url).split(/[?#]/)[0]; }
+      navTrace.push(ev + " " + String(where).slice(0, 120));
+    }
     var p = new Promise(function (resolve, reject) {
       var authUrl = details && details.url;
       if (!authUrl) { reject(new Error("launchWebAuthFlow: missing url")); return; }
@@ -74,8 +165,8 @@
       } catch (e) { /* keep default */ }
       DBG("[idpoly] redirectTarget", redirectTarget);
 
-      if (!api.tabs || !api.webNavigation) {
-        reject(new Error("launchWebAuthFlow requires the tabs + webNavigation APIs, which are unavailable"));
+      if (!api.tabs || typeof api.tabs.create !== "function") {
+        reject(new Error("launchWebAuthFlow requires the tabs API, which is unavailable"));
         return;
       }
       // `interactive: false` is a silent token refresh, not a login. Chrome runs it with
@@ -94,6 +185,14 @@
       // Chrome's default: a page that finishes loading without redirecting means the
       // provider wants the user, so the silent attempt is over.
       var abortOnLoad = !(details && details.abortOnLoadForNonInteractive === false);
+      // A silent flow still needs a real surface: Safari gives an extension no invisible
+      // one. Both alternatives were measured and are worse than a background tab — it
+      // ignores state:"minimized" on windows.create, and it clamps an off-screen popup
+      // back onto the display, so either way a window flashes in the user's face. A
+      // background tab at least stays inside the window they are already looking at.
+      // What keeps this rare is the session store surviving a background restart (see
+      // the shim's session mirror); without that, every wake re-ran the flow.
+      // Interactive flows get a real, focused tab: those have to be seen.
       api.tabs.create({ url: authUrl, active: interactive }, function (tab) {
         if (api.runtime.lastError || !tab) {
           console.error("[idpoly] tab create err", api.runtime.lastError);
@@ -102,6 +201,7 @@
         }
         var tabId = tab.id;
         var settled = false;
+        var lastUrl = null;
         DBG("[idpoly] auth tab", tabId, "interactive", interactive, "url", authUrl);
         // The caller's non-interactive deadline is meant to bound how long the PROVIDER
         // takes to answer, which is what it measures in Chrome. Here it would also be
@@ -116,15 +216,15 @@
         // is usually racing a timer of its own.
         var SILENT_SETUP_MS = 8000, SILENT_CEILING_MS = 20000;
         var timer = null, clockStarted = false;
+        // Every abandonment goes through finish(), so a silent attempt that simply ran
+        // out of time is recorded like any other outcome. A timeout that cleaned up on
+        // its own left no trace of itself anywhere, which is the one failure mode that
+        // most needs a record.
         function arm(ms, why) {
           clearTimeout(timer);
           timer = setTimeout(function () {
             DBGW("[idpoly] TIMEOUT", tabId, why);
-            if (settled) return;
-            settled = true;
-            cleanup();
-            try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
-            reject(new Error(interactive ? "launchWebAuthFlow timeout" : "launchWebAuthFlow: no silent redirect (" + why + ")"));
+            finish(reject, new Error(interactive ? "launchWebAuthFlow timeout" : "launchWebAuthFlow: no silent redirect (" + why + ")"));
           }, ms);
         }
         // Bound the whole attempt regardless of what the phases do.
@@ -148,46 +248,28 @@
           var next = url.charAt(redirectTarget.length);
           return next === "" || next === "/" || next === "?" || next === "#";
         }
-        function onNav(d) {
-          // Only the auth tab's TOP-LEVEL navigation may complete the flow. Chrome's
-          // launchWebAuthFlow watches its dedicated auth window's main frame; without
-          // the frameId===0 check a sub-iframe navigating to a URL that startsWith the
-          // redirect target would resolve the flow with a frame-controlled URL the
-          // caller then parses for the OAuth code/token.
-          if (d.tabId !== tabId || d.frameId !== 0) return;
-          DBG("[idpoly] nav", d.url);
-          if (captured(d.url)) { finish(resolve, d.url); return; }
-          // The provider has been reached; from here the caller's own window applies.
-          startCallerClock();
-        }
-        function onErr(d) {
-          if (d.tabId !== tabId || d.frameId !== 0) return;
-          DBG("[idpoly] navERR", d.url, d.error);
-          if (captured(d.url)) finish(resolve, d.url);
-        }
-        function onRemoved(id) {
-          if (id === tabId) { DBGW("[idpoly] tab removed"); finish(reject, new Error("auth tab closed")); }
-        }
-        function onDone(d) {
-          if (d.tabId !== tabId || d.frameId !== 0) return;
-          if (captured(d.url)) { finish(resolve, d.url); return; }
+        function onTabEvent(ev, url) {
+          if (settled) return;
+          if (ev === "closed") { DBGW("[idpoly] tab removed"); finish(reject, new Error("auth tab closed")); return; }
+          if (url !== lastUrl) { lastUrl = url; DBG("[idpoly] nav", ev, url); note(ev, url); }
+          if (captured(url)) { finish(resolve, url); return; }
           // A silent attempt whose page finished loading somewhere other than the
           // redirect target is the provider asking for the user. Chrome ends the
           // attempt there; hanging on would keep a background tab open on a login
           // screen the caller has already stopped waiting for.
-          if (!interactive && abortOnLoad) {
+          if (ev === "loaded" && !interactive && abortOnLoad) {
             DBG("[idpoly] silent attempt needs interaction, aborting");
             finish(reject, new Error("launchWebAuthFlow: interaction required"));
+            return;
           }
+          // The provider has been reached; from here the caller's own window applies.
+          startCallerClock();
         }
         function cleanup() {
           clearTimeout(timer);
           clearTimeout(ceiling);
-          api.webNavigation.onBeforeNavigate.removeListener(onNav);
-          api.webNavigation.onCommitted.removeListener(onNav);
-          api.webNavigation.onCompleted.removeListener(onDone);
-          api.webNavigation.onErrorOccurred.removeListener(onErr);
-          api.tabs.onRemoved.removeListener(onRemoved);
+          clearInterval(poll);
+          delete authTabs[tabId];
         }
         function finish(fn, arg) {
           if (settled) return;
@@ -200,15 +282,28 @@
             try { var ru = new URL(arg); redacted = ru.origin + ru.pathname + " (params redacted)"; } catch (e) { redacted = "(redirect url redacted)"; }
           }
           DBG("[idpoly] finish ->", (fn === resolve ? "RESOLVE " + redacted : "reject " + arg));
+          recordOutcome(interactive, fn === resolve, fn === resolve ? "redirected" : String((arg && arg.message) || arg), Date.now() - startedAt, navTrace);
           try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
           fn(arg);
         }
 
-        api.webNavigation.onBeforeNavigate.addListener(onNav);
-        api.webNavigation.onCommitted.addListener(onNav);
-        api.webNavigation.onCompleted.addListener(onDone);
-        api.webNavigation.onErrorOccurred.addListener(onErr);
-        api.tabs.onRemoved.addListener(onRemoved);
+        authTabs[tabId] = onTabEvent;
+        // Third source, and the only one measured to work for a tab opened in the
+        // background on Safari 18: ask the tab where it is. tabs.get answers with the
+        // URL a navigation left behind even when no navigation event was delivered.
+        var poll = setInterval(function () {
+          if (settled) return;
+          var seen = function (t) {
+            void api.runtime.lastError;
+            if (!t) { onTabEvent("closed", ""); return; }
+            var u = t.url || t.pendingUrl;
+            if (u) onTabEvent("poll", u);
+          };
+          try {
+            var r = api.tabs.get(tabId, seen);
+            if (r && typeof r.then === "function") r.then(seen, function () {});
+          } catch (e) {}
+        }, 250);
       });
     });
 

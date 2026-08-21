@@ -19,14 +19,24 @@ const polyfill = readFileSync(join(TEMPLATE_DIR, "identity-polyfill.js"), "utf8"
 function background() {
   const created = [];
   const removed = [];
+  // Safari does not deliver webNavigation events for the auth tab at all (see the
+  // poll-only test below), so the tab's own reported URL is modelled separately: a test
+  // moves `tab.url` the way a navigation would, and fires events only when it wants to
+  // check the paths a browser that DOES report them takes.
+  const tab = { id: 99, url: undefined, gone: false };
   const nav = { onBeforeNavigate: [], onCommitted: [], onCompleted: [], onErrorOccurred: [] };
   const ev = (bucket) => ({
     addListener: (f) => nav[bucket].push(f),
     removeListener: (f) => { const i = nav[bucket].indexOf(f); if (i >= 0) nav[bucket].splice(i, 1); },
   });
+  const timers = new Set();
   const bg = {
     console: { log() {}, warn() {}, error() {} },
-    URL, Promise, setTimeout, clearTimeout, Number, Object, JSON, String, Error, Date,
+    URL, Promise, Number, Object, Array, JSON, String, Error, Date, Math,
+    setTimeout: (f, m) => { const h = setTimeout(f, m); timers.add(h); return h; },
+    clearTimeout: (h) => { timers.delete(h); clearTimeout(h); },
+    setInterval: (f, m) => { const h = setInterval(f, m); timers.add(h); return h; },
+    clearInterval: (h) => { timers.delete(h); clearInterval(h); },
     location: { href: "safari-web-extension://ABC/background.html", pathname: "/background.html" },
     navigator: { userAgent: "test" },
     chrome: {
@@ -38,9 +48,11 @@ function background() {
         lastError: undefined,
       },
       tabs: {
-        create(opts, cb) { created.push(opts); cb({ id: 99 }); },
-        remove(id, cb) { removed.push(id); if (cb) cb(); },
+        create(opts, cb) { created.push(opts); cb({ id: tab.id }); },
+        get(id, cb) { cb(id === tab.id && !tab.gone ? { id: tab.id, url: tab.url } : undefined); },
+        remove(id, cb) { removed.push(id); tab.gone = true; if (cb) cb(); },
         onRemoved: { addListener() {}, removeListener() {} },
+        onUpdated: { addListener() {}, removeListener() {} },
       },
       webNavigation: {
         onBeforeNavigate: ev("onBeforeNavigate"),
@@ -54,7 +66,8 @@ function background() {
   vm.createContext(bg);
   vm.runInContext(polyfill, bg, { filename: "identity-polyfill.js" });
   const fire = (bucket, detail) => { for (const f of nav[bucket].slice()) f(detail); };
-  return { bg, created, removed, fire };
+  const stop = () => { for (const h of timers) { clearTimeout(h); clearInterval(h); } };
+  return { bg, created, removed, fire, tab, nav, stop };
 }
 
 const AUTH = "https://claude.ai/oauth/authorize?redirect_uri=" +
@@ -160,4 +173,60 @@ test("a tab that never navigates is given up on without waiting out the ceiling"
   const p = bg.chrome.identity.launchWebAuthFlow({ url: AUTH, interactive: false, timeoutMsForNonInteractive: 100 });
   await assert.rejects(p, /tab never navigated/);
   assert.deepEqual(removed, [99], "and the tab is closed");
+});
+
+// The bug this file's harness now models. Safari delivers NO webNavigation event for the
+// auth tab: measured on Safari 18 with the background page provably alive (a 2s heartbeat
+// kept ticking through the attempt), every silent flow ended with an empty navigation list
+// and "tab never navigated", while Safari's own history showed the authorize page had
+// loaded and redirected. For Claude for Chrome — whose tokens live in storage.session and
+// whose only recovery is this flow — that meant a login screen on every launch. Asking the
+// tab where it is works, so the flow leans on that and treats the events as a fast path.
+test("a flow completes on the tab's own URL when no navigation event is delivered", async (t) => {
+  const { bg, tab, removed, stop } = background();
+  t.after(stop);
+  const p = bg.chrome.identity.launchWebAuthFlow({
+    url: AUTH, interactive: false, abortOnLoadForNonInteractive: false, timeoutMsForNonInteractive: 3000,
+  });
+  tab.url = "https://claude.ai/oauth/authorize?prompt=none";   // page loaded, no event
+  await new Promise((r) => setTimeout(r, 400));
+  tab.url = "https://fcoe.chromiumapp.org/?code=abc";          // redirected, no event
+  assert.equal(await p, "https://fcoe.chromiumapp.org/?code=abc");
+  assert.deepEqual(removed, [99], "and the tab it opened is closed again");
+});
+
+test("the tab's reported URL cannot smuggle in a look-alike callback", async (t) => {
+  const { bg, tab, stop } = background();
+  t.after(stop);
+  const p = bg.chrome.identity.launchWebAuthFlow({
+    url: AUTH, interactive: false, abortOnLoadForNonInteractive: false, timeoutMsForNonInteractive: 400,
+  });
+  tab.url = "https://fcoe.chromiumapp.org.evil.test/?code=stolen";
+  await assert.rejects(p, /no silent redirect/, "prefix alone is not the redirect target");
+});
+
+// Safari only delivers webNavigation to listeners the background page registered while it
+// was evaluating; one added later, when a flow opens its tab, receives nothing. So the
+// observers are installed at load and routed per tab, and a flow adds none of its own.
+test("navigation observers are registered at load, not per flow", async (t) => {
+  const { bg, nav, tab, stop } = background();
+  t.after(stop);
+  const atLoad = Object.keys(nav).map((k) => nav[k].length);
+  assert.ok(atLoad.every((n) => n === 1), `one observer per event at load, got ${atLoad}`);
+  const p = bg.chrome.identity.launchWebAuthFlow({
+    url: AUTH, interactive: false, abortOnLoadForNonInteractive: false, timeoutMsForNonInteractive: 3000,
+  });
+  assert.deepEqual(Object.keys(nav).map((k) => nav[k].length), atLoad, "a flow adds no listeners");
+  tab.url = "https://fcoe.chromiumapp.org/?code=abc";
+  await p;
+  assert.deepEqual(Object.keys(nav).map((k) => nav[k].length), atLoad, "and removes none");
+});
+
+test("a delivered navigation event still completes the flow at once", async (t) => {
+  // The events are a fast path where a browser does report them: no waiting on a poll.
+  const { bg, fire, stop } = background();
+  t.after(stop);
+  const p = bg.chrome.identity.launchWebAuthFlow({ url: AUTH, interactive: false });
+  fire("onErrorOccurred", { tabId: 99, frameId: 0, url: "https://fcoe.chromiumapp.org/?code=abc" });
+  assert.equal(await p, "https://fcoe.chromiumapp.org/?code=abc", "a dead redirect host still carries the code");
 });
