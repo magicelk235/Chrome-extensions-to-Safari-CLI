@@ -6114,6 +6114,109 @@ var __C2S_DEBUG__ = false;
       var isBg = /background\.html$/.test((typeof location !== "undefined" && location.pathname) || "");
 
       if (isBg) {
+        // Safari hands every PAGE LOAD its own session store, so the background's own
+        // storage.session comes up EMPTY on every restart. Chrome keeps it for the life
+        // of the browser session, which is the entire reason an extension puts state
+        // there — Claude for Chrome migrates its OAuth tokens into session storage on
+        // purpose, to keep them off disk. Measured on Safari 18: a fresh background page
+        // read back no token seconds after the previous one had stored a valid one, so
+        // every wake answered the panel with a login screen and opened another re-auth
+        // tab, and a login never appeared to survive anything.
+        //
+        // So mirror the owner's session store into storage.local, and restore it when the
+        // background comes back. The mirror is stamped and expires, which bounds how long
+        // values the extension kept out of storage.local sit there; past that the
+        // extension takes its own recovery path (for an OAuth bundle, a silent re-auth).
+        // A browser-start signal would be better than a deadline, but Safari never fires
+        // runtime.onStartup for a converted background (measured), so there is none.
+        var MIRROR_KEY = "__c2sSessMirror", MIRROR_TTL = 12 * 60 * 60 * 1000;
+        var mirror = {}, restored = false, waiting = [];
+        var local = null;
+        try { local = chrome.storage.local; } catch (e) {}
+        var saveMirror = function () {
+          if (!local) return;
+          var w = {}; w[MIRROR_KEY] = { t: Date.now(), v: mirror };
+          try { var r = local.set(w); if (r && r.then) r.then(function () {}, function () {}); } catch (e) {}
+        };
+        // Patch the native area in place so BOTH callers are covered: the bundle running
+        // in this page, and the relayed get/set the owner answers for other contexts
+        // (the listener below resolves these members at call time).
+        var area = mutableNamespace(chrome.storage, "session") || s;
+        var nat = {};
+        for (var __op in { get: 1, set: 1, remove: 1, clear: 1 }) {
+          try { if (typeof area[__op] === "function") nat[__op] = area[__op].bind(area); } catch (e) {}
+        }
+        var once = function (fn) { var ran = false; return function () { if (!ran) { ran = true; fn(); } }; };
+        if (nat.set) {
+          installOverride(area, "set", function (obj, cb) {
+            try { for (var k in obj) mirror[k] = obj[k]; saveMirror(); } catch (e) {}
+            var p = nat.set(obj, typeof cb === "function" ? cb : undefined);
+            return p;
+          });
+        }
+        if (nat.remove) {
+          installOverride(area, "remove", function (keys, cb) {
+            try {
+              var list = Array.isArray(keys) ? keys : [keys];
+              for (var i = 0; i < list.length; i++) delete mirror[list[i]];
+              saveMirror();
+            } catch (e) {}
+            return nat.remove(keys, typeof cb === "function" ? cb : undefined);
+          });
+        }
+        if (nat.clear) {
+          installOverride(area, "clear", function (cb) {
+            mirror = {}; saveMirror();
+            return nat.clear(typeof cb === "function" ? cb : undefined);
+          });
+        }
+        // A read that arrives before the restore has landed would see the empty store and
+        // conclude the state is gone — which is the exact bug this block exists to fix. So
+        // hold reads until the restore settles; it is one storage.local round trip.
+        if (nat.get) {
+          installOverride(area, "get", function (arg, cb) {
+            var run = function () {
+              var p = nat.get(arg, typeof cb === "function" ? cb : undefined);
+              return p;
+            };
+            if (restored) return run();
+            if (typeof cb === "function") { waiting.push(function () { run(); }); return undefined; }
+            return new Promise(function (resolve) {
+              waiting.push(function () {
+                var r = nat.get(arg, function (o) { resolve(o); });
+                if (r && typeof r.then === "function") r.then(resolve, function () { resolve({}); });
+              });
+            });
+          });
+        }
+        var finishRestore = once(function () {
+          restored = true;
+          var q = waiting; waiting = [];
+          for (var i = 0; i < q.length; i++) { try { q[i](); } catch (e) {} }
+        });
+        if (!local || !nat.set) finishRestore();
+        else {
+          var apply = function (rec) {
+            var v = rec && rec[MIRROR_KEY];
+            if (!v || !v.v || typeof v.t !== "number" || Date.now() - v.t > MIRROR_TTL || !Object.keys(v.v).length) {
+              if (v) { try { local.remove(MIRROR_KEY); } catch (e) {} }
+              finishRestore(); return;
+            }
+            mirror = v.v;
+            // Restore through the NATIVE setter: going through the override would just
+            // write the same mirror back out again.
+            try {
+              var w = nat.set(v.v, finishRestore);
+              if (w && typeof w.then === "function") w.then(finishRestore, finishRestore);
+            } catch (e) { finishRestore(); }
+          };
+          try {
+            var g = local.get(MIRROR_KEY, apply);
+            if (g && typeof g.then === "function") g.then(apply, function () { finishRestore(); });
+          } catch (e) { finishRestore(); }
+        }
+        try { s = chrome.storage.session || s; } catch (e) {}
+
         // Owner side: answer for the native store. Registered AFTER the storage relay
         // installs, because the relay mirrors mailbox records only into listeners it
         // recorded itself: a listener added earlier reaches the native event alone, and
