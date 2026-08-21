@@ -98,14 +98,18 @@ test("abortOnLoadForNonInteractive:false waits for the caller's deadline instead
   assert.deepEqual(removed, [99]);
 });
 
-test("the silent deadline is the caller's, not the interactive ceiling", async () => {
+test("a silent attempt never runs to the interactive ceiling", async () => {
+  // A dead attempt has to end while the caller is still listening. Callers race these on
+  // their own short timers (Claude allows itself 15s), so anything near the 120s
+  // interactive ceiling is the same as hanging.
   const { bg } = background();
   const started = Date.now();
   await assert.rejects(
     bg.chrome.identity.launchWebAuthFlow({ url: AUTH, interactive: false, timeoutMsForNonInteractive: 250 }),
     /no silent redirect/
   );
-  assert.ok(Date.now() - started < 3000, "gave up on the caller's clock");
+  const took = Date.now() - started;
+  assert.ok(took < 12000, `ended in ${took}ms, well inside a caller's patience`);
 });
 
 test("a redirect inside a sub-frame cannot complete the flow", async () => {
@@ -116,4 +120,44 @@ test("a redirect inside a sub-frame cannot complete the flow", async () => {
   fire("onBeforeNavigate", { tabId: 99, frameId: 3, url: "https://fcoe.chromiumapp.org/?code=stolen" });
   assert.equal(settled, false, "frameId 0 only");
   await assert.rejects(p, /no silent redirect/);
+});
+
+// The caller's non-interactive deadline is meant to bound how long the PROVIDER takes.
+// Spending it on tab creation and Safari loading the authorize page cold means a 5s budget
+// (Claude's) can be gone before the provider is even asked: the redirect arrives after the
+// attempt was abandoned, the caller falls back to an interactive login, and the user sees a
+// tab flash past and a login screen for no reason.
+test("the caller's window covers the provider, not our tab setup", async () => {
+  const { bg, created, fire } = background();
+  const p = bg.chrome.identity.launchWebAuthFlow({
+    url: AUTH, interactive: false, timeoutMsForNonInteractive: 250,
+  });
+  assert.equal(created.length, 1);
+  // Setup is slower than the caller's whole budget, as a cold tab load can be.
+  await new Promise((r) => setTimeout(r, 700));
+  // The page reaches the provider only now, and then redirects within the caller's window.
+  fire("onCommitted", { tabId: 99, frameId: 0, url: "https://claude.ai/oauth/authorize?prompt=none" });
+  fire("onBeforeNavigate", { tabId: 99, frameId: 0, url: "https://fcoe.chromiumapp.org/?code=abc" });
+  assert.equal(await p, "https://fcoe.chromiumapp.org/?code=abc", "not abandoned during setup");
+});
+
+test("a provider that never redirects still ends on the caller's clock", async () => {
+  const { bg, removed, fire } = background();
+  const started = Date.now();
+  const p = bg.chrome.identity.launchWebAuthFlow({
+    url: AUTH, interactive: false, abortOnLoadForNonInteractive: false, timeoutMsForNonInteractive: 300,
+  });
+  fire("onCommitted", { tabId: 99, frameId: 0, url: "https://claude.ai/oauth/authorize?prompt=none" });
+  await assert.rejects(p, /no silent redirect/);
+  const took = Date.now() - started;
+  assert.ok(took >= 250, `waited for the provider (${took}ms)`);
+  assert.ok(took < 4000, `but not the setup allowance (${took}ms)`);
+  assert.deepEqual(removed, [99]);
+});
+
+test("a tab that never navigates is given up on without waiting out the ceiling", async () => {
+  const { bg, removed } = background();
+  const p = bg.chrome.identity.launchWebAuthFlow({ url: AUTH, interactive: false, timeoutMsForNonInteractive: 100 });
+  await assert.rejects(p, /tab never navigated/);
+  assert.deepEqual(removed, [99], "and the tab is closed");
 });

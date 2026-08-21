@@ -103,15 +103,41 @@
         var tabId = tab.id;
         var settled = false;
         DBG("[idpoly] auth tab", tabId, "interactive", interactive, "url", authUrl);
-        var timer = setTimeout(function () {
-          DBGW("[idpoly] TIMEOUT", tabId);
-          if (!settled) {
+        // The caller's non-interactive deadline is meant to bound how long the PROVIDER
+        // takes to answer, which is what it measures in Chrome. Here it would also be
+        // paying for a tab being created and Safari loading the authorize page cold,
+        // through whatever edge sits in front of it, and a 5s budget (Claude's) is
+        // routinely gone before the provider is even asked. The redirect then arrives
+        // after the attempt was abandoned, the caller falls back to an interactive login,
+        // and the user gets a tab flashing past and a login screen for no reason.
+        //
+        // So allow the setup separately, and start the caller's clock when the auth page
+        // first navigates. A hard ceiling still bounds the whole thing, since the caller
+        // is usually racing a timer of its own.
+        var SILENT_SETUP_MS = 8000, SILENT_CEILING_MS = 20000;
+        var timer = null, clockStarted = false;
+        function arm(ms, why) {
+          clearTimeout(timer);
+          timer = setTimeout(function () {
+            DBGW("[idpoly] TIMEOUT", tabId, why);
+            if (settled) return;
             settled = true;
             cleanup();
             try { api.tabs.remove(tabId, function () { void api.runtime.lastError; }); } catch (e) {}
-            reject(new Error(interactive ? "launchWebAuthFlow timeout" : "launchWebAuthFlow: no silent redirect"));
-          }
-        }, interactive ? 120000 : quietMs);
+            reject(new Error(interactive ? "launchWebAuthFlow timeout" : "launchWebAuthFlow: no silent redirect (" + why + ")"));
+          }, ms);
+        }
+        // Bound the whole attempt regardless of what the phases do.
+        var ceiling = interactive ? null : setTimeout(function () {
+          if (!settled) arm(0, "ceiling");
+        }, SILENT_CEILING_MS);
+        function startCallerClock() {
+          if (clockStarted || interactive || settled) return;
+          clockStarted = true;
+          DBG("[idpoly] auth page navigated; caller's silent window starts now:", quietMs + "ms");
+          arm(quietMs, "provider did not redirect");
+        }
+        arm(interactive ? 120000 : SILENT_SETUP_MS, interactive ? "user did not finish" : "tab never navigated");
 
         function captured(url) {
           if (typeof url !== "string" || url.indexOf(redirectTarget) !== 0) return false;
@@ -130,7 +156,9 @@
           // caller then parses for the OAuth code/token.
           if (d.tabId !== tabId || d.frameId !== 0) return;
           DBG("[idpoly] nav", d.url);
-          if (captured(d.url)) finish(resolve, d.url);
+          if (captured(d.url)) { finish(resolve, d.url); return; }
+          // The provider has been reached; from here the caller's own window applies.
+          startCallerClock();
         }
         function onErr(d) {
           if (d.tabId !== tabId || d.frameId !== 0) return;
@@ -154,6 +182,7 @@
         }
         function cleanup() {
           clearTimeout(timer);
+          clearTimeout(ceiling);
           api.webNavigation.onBeforeNavigate.removeListener(onNav);
           api.webNavigation.onCommitted.removeListener(onNav);
           api.webNavigation.onCompleted.removeListener(onDone);
