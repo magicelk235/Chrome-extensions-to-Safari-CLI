@@ -4748,83 +4748,83 @@ var __C2S_DEBUG__ = false;
     // caller's whole init chain. Sanitize the filter to the parseable subset; if
     // nothing survives, register nothing — the listener could only ever have fired
     // for traffic Safari cannot observe anyway.
-    // The native EVENT objects are frozen (addListener non-configurable), so an
-    // in-place addListener override can't take — replace each event wholesale on
-    // the (thawed, extensible) webRequest namespace with a facade prototyping the
-    // native and shadowing the listener methods. chrome === browser post-thaw, so
-    // one pass covers both namespaces.
+    // The native EVENT instances may be frozen (addListener non-configurable), so
+    // patch adaptively: the instance when it takes, else the shared wrapper
+    // PROTOTYPE (freezing an instance never freezes its prototype), else leave the
+    // event native. NEVER republish the global chrome/browser roots — see below.
     (function (wr) {
-      if (!wr) return;
       var VALID_URL_PATTERN = /^(\*|https?|file|ftp):\/\//;
-      // Plain assignment cannot shadow the frozen prototype's non-writable
-      // addListener (strict-mode TypeError that would abort the whole shim tail);
-      // defineProperty is exempt from that restriction.
-      function def(obj, k, v) {
-        Object.defineProperty(obj, k, { value: v, writable: true, configurable: true });
+      // Patch addListener IN PLACE on each native event object (the same in-place
+      // move the storage relay uses on runtime.onMessage). The previous approach —
+      // a facade namespace republished on NEW global chrome/browser roots — silently
+      // killed all native message delivery to the context: WebKit re-derives the
+      // dispatch namespace from the page's global `browser`/`chrome` at EVERY
+      // message (enumerateFramesAndNamespaceObjects), and the cast it uses
+      // (toWebExtensionAPINamespace) only succeeds on the native namespace wrapper.
+      // Any other object there — a Proxy, an Object.create(native) root, a polyfill —
+      // makes Safari skip the frame: listeners stay registered, the sender's callback
+      // resolves undefined with no lastError, and nothing is delivered (live: TWP's
+      // translateHTML on its webRequest-holding MV3 background). The global bindings
+      // MUST keep the native object; see Safari-Quirks E15.
+      function sanitizeArgs(args) {
+        var f = args[1];
+        if (f && Array.isArray(f.urls)) {
+          var kept = f.urls.filter(function (u) {
+            return u === "<all_urls>" || VALID_URL_PATTERN.test(String(u));
+          });
+          if (kept.length === 0) return null; // only unwatchable schemes → inert
+          if (kept.length !== f.urls.length) args[1] = Object.assign({}, f, { urls: kept });
+        }
+        return args;
       }
-      function sanitizedEvent(native) {
-        if (!native || typeof native.addListener !== "function" || native.__c2sUrlSanitized) return null;
-        var facade;
+      function sanitizeAdd(native) {
+        if (!native || typeof native.addListener !== "function") return;
+        var origAdd = native.addListener;
+        if (origAdd.__c2sUrlSanitized) return;
+        var wrapped = function () {
+          var args = sanitizeArgs([].slice.call(arguments));
+          if (!args) return undefined;
+          return origAdd.apply(this === wrapped || this === undefined ? native : this, args);
+        };
+        wrapped.__c2sUrlSanitized = true;
+        // In-place on the instance first (same move the storage relay proved on
+        // runtime.onMessage).
+        if (installOverride(native, "addListener", wrapped) && native.addListener === wrapped) return;
+        // Frozen instance: patch the shared wrapper prototype that actually holds
+        // the method. The wrapper stays transparent for events whose addListener
+        // never takes a RequestFilter (args[1].urls is the discriminator).
         try {
-          facade = Object.create(native);
-          def(facade, "__c2sUrlSanitized", true);
-          def(facade, "addListener", function () {
-            var args = [].slice.call(arguments);
-            var f = args[1];
-            if (f && Array.isArray(f.urls)) {
-              var kept = f.urls.filter(function (u) {
-                return u === "<all_urls>" || VALID_URL_PATTERN.test(String(u));
-              });
-              if (kept.length === 0) return undefined; // only unwatchable schemes → inert
-              if (kept.length !== f.urls.length) args[1] = Object.assign({}, f, { urls: kept });
-            }
-            return native.addListener.apply(native, args);
-          });
-          def(facade, "removeListener", function (fn) {
-            return typeof native.removeListener === "function" ? native.removeListener.call(native, fn) : undefined;
-          });
-          def(facade, "hasListener", function (fn) {
-            return typeof native.hasListener === "function" ? native.hasListener.call(native, fn) : false;
-          });
-        } catch (e) { return null; }
-        return facade;
+          var proto = Object.getPrototypeOf(native);
+          while (proto && !Object.prototype.hasOwnProperty.call(proto, "addListener")) proto = Object.getPrototypeOf(proto);
+          if (!proto) return;
+          var protoAdd = proto.addListener;
+          if (typeof protoAdd !== "function" || protoAdd.__c2sUrlSanitized) return;
+          var protoWrapped = function () {
+            var args = sanitizeArgs([].slice.call(arguments));
+            if (!args) return undefined;
+            return protoAdd.apply(this, args);
+          };
+          protoWrapped.__c2sUrlSanitized = true;
+          // If the prototype refuses too, leave everything NATIVE. An unsanitized
+          // addListener can throw on a bad pattern, which aborts one call;
+          // republishing the root aborts every message the context would receive.
+          installOverride(proto, "addListener", protoWrapped);
+        } catch (e) {}
       }
       var evNames = ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders",
         "onHeadersReceived", "onAuthRequired", "onResponseStarted",
         "onBeforeRedirect", "onCompleted", "onErrorOccurred"];
-      // The native webRequest object is extensible but its event PROPERTIES are
-      // locked (non-writable, non-configurable), so installing a facade per event
-      // silently fails. Shadow at the level we DO own: build a namespace facade
-      // prototyping the native and republish it on the thawed chrome/browser roots.
-      var wrFacade = null;
       for (var i = 0; i < evNames.length; i++) {
-        try {
-          var facade = sanitizedEvent(wr[evNames[i]]);
-          if (!facade) continue;
-          if (!wrFacade) wrFacade = Object.create(wr);
-          def(wrFacade, evNames[i], facade);
-        } catch (e) {}
+        try { sanitizeAdd(wr[evNames[i]]); } catch (e) {}
       }
-      if (wrFacade) {
-        var target = chrome;
-        installOverride(target, "webRequest", wrFacade);
-        if (target.webRequest !== wrFacade) {
-          // The native root silently ignores BOTH assignment and defineProperty
-          // for this slot (proven live: descriptor claims configurable, define
-          // "succeeds", read returns the old value — a WebKit exotic). Same move
-          // as the frozen-root thaw: shadow on a new root prototyping the native
-          // and republish the GLOBAL BINDINGS, which are always reassignable.
-          try {
-            var newRoot = Object.create(target);
-            Object.defineProperty(newRoot, "webRequest", { value: wrFacade, writable: true, configurable: true });
-            var sameRoots = (typeof browser !== "undefined") && browser === target;
-            __publishGlobal("chrome", newRoot);
-            if (sameRoots) __publishGlobal("browser", newRoot);
-          } catch (e) {}
-        } else if (typeof browser !== "undefined" && browser !== chrome) {
-          installOverride(browser, "webRequest", wrFacade);
+      // A distinct browser root (non-Safari hosts) exposes its own event objects.
+      try {
+        if (typeof browser !== "undefined" && browser !== chrome && browser.webRequest && browser.webRequest !== wr) {
+          for (var j = 0; j < evNames.length; j++) {
+            try { sanitizeAdd(browser.webRequest[evNames[j]]); } catch (e) {}
+          }
         }
-      }
+      } catch (e) {}
     })(chrome.webRequest);
 
     // chrome.declarativeContent — bundles construct matchers at module-eval
