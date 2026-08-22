@@ -4069,7 +4069,6 @@ var __C2S_DEBUG__ = false;
       onVisited: event(), onVisitRemoved: event(),
     });
 
-    // chrome.bookmarks — same: partial/gated. Reads return an empty tree.
     // chrome.bookmarks — Safari exposes no bookmark API, so emulate the whole thing
     // against a flat node map persisted in chrome.storage.local. Real CRUD, search,
     // tree assembly, and live events (onCreated/onRemoved/onChanged/onMoved). The
