@@ -97,6 +97,9 @@ export interface ConvertOptions {
   installDir?: string;
   /** During --install, quit/relaunch Safari and write the unsigned toggle. */
   safariRestart: boolean;
+  /** During --install, launch the host app hidden (it still registers the appex).
+   *  For wrapping UIs — the Viaduct app finishes its own flow, then opens the app. */
+  backgroundLaunch?: boolean;
   /** Apple Developer Team ID to sign with (real signing → persists across Safari quits). */
   team?: string;
   /** `team` came from detection (--team auto / plain --install), not from the user

@@ -19,6 +19,8 @@ export interface InstallOptions {
   safariRestart: boolean;
   /** App is signed with a real Apple team → skip the unsigned toggle (it persists). */
   signed: boolean;
+  /** Launch the host app hidden and without activation (registration only). */
+  backgroundLaunch?: boolean;
 }
 
 export interface InstallResult {
@@ -122,13 +124,20 @@ export function installToSafari(opts: InstallOptions): InstallResult {
   }
 
   info("Launching host app to register the extension …");
-  const launch = run("/usr/bin/open", [dest]);
+  // --background-launch: `open -g -j` still launches the app (which is what makes
+  // PlugInKit register the appex) but hidden and without stealing focus, so no
+  // window pops over the caller's UI. The Viaduct app opens the host app itself
+  // once its converting animation has finished.
+  const launch = run("/usr/bin/open", opts.backgroundLaunch ? ["-g", "-j", dest] : [dest]);
   if (launch.code !== 0) {
     warn(`Could not launch the host app (open exit ${launch.code}); the extension may not register. Open ${dest} manually.`);
   }
 
   if (applyUnsigned) {
-    const reopen = run("/usr/bin/open", ["-a", "Safari"]);
+    // Under --background-launch, bring Safari back without stealing focus —
+    // same reason as the host-app launch above.
+    const reopenArgs = opts.backgroundLaunch ? ["-g", "-a", "Safari"] : ["-a", "Safari"];
+    const reopen = run("/usr/bin/open", reopenArgs);
     if (reopen.code !== 0) warn(`Could not relaunch Safari (open exit ${reopen.code}); reopen it manually.`);
   }
 

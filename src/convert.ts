@@ -472,6 +472,7 @@ export function convert(opts: ConvertOptions): ConvertResult {
         bundleId,
         installDir: opts.installDir,
         safariRestart: opts.safariRestart,
+        backgroundLaunch: !!opts.backgroundLaunch,
         signed: !!team,
       });
       if (inst.installedAppPath) {

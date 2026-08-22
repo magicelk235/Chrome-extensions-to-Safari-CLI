@@ -23,7 +23,7 @@ import type { Platforms } from "./types.js";
 const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
-  "no-safari-restart", "team", "no-shim", "no-oauth-bridge", "keep-module",
+  "no-safari-restart", "background-launch", "team", "no-shim", "no-oauth-bridge", "keep-module",
   "force", "strict", "verify", "clean",
 ] as const;
 
@@ -32,7 +32,7 @@ const CONFIG_KEYS = [
 // JS and would silently flip the flag ON. The rest are string-typed.
 const BOOLEAN_CONFIG_KEYS = new Set<string>([
   "ci", "zip", "no-build", "open-xcode", "install", "no-safari-restart",
-  "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify", "clean",
+  "background-launch", "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify", "clean",
 ]);
 
 // Config keys that also have a short CLI alias. Used to detect "the user typed it on
@@ -153,6 +153,8 @@ OPTIONS
       --verify              After --install, check Safari registered/enabled the extension
       --install-dir <dir>   Install target directory (default: ~/Applications)
       --no-safari-restart   With --install, don't quit/relaunch Safari or set the unsigned toggle
+      --background-launch   With --install, launch the host app hidden: the extension still
+                            registers, but no window opens over whatever is on screen
       --team <id>           Sign with an Apple Developer Team ID. Real signing keeps the
                             extension enabled across Safari quits, with no unsigned toggle.
                             Use --team auto (or plain --install) to auto-detect the team
@@ -335,6 +337,7 @@ async function main(): Promise<void> {
         install: { type: "boolean", default: false },
         "install-dir": { type: "string" },
         "no-safari-restart": { type: "boolean", default: false },
+        "background-launch": { type: "boolean", default: false },
         team: { type: "string" },
         verify: { type: "boolean", default: false },
         config: { type: "string" },
@@ -593,6 +596,7 @@ async function main(): Promise<void> {
         install: values.install,
         installDir: values["install-dir"],
         safariRestart: !values["no-safari-restart"],
+        backgroundLaunch: values["background-launch"],
         team,
         teamAutoDetected,
         force: values.force,
