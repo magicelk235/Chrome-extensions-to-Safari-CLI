@@ -54,6 +54,43 @@ test("subdir stylesheet is resolved relative to the html file", () => {
   assert.ok(!/c2s-color-scheme/.test(html), "dark-aware subdir CSS must be detected");
 });
 
+test("the light floor paints body, never html, so a JS-applied dark theme wins", () => {
+  // TWP's popup appends `html *{background-color:#181a1b!important}` from JS when the
+  // OS is dark. `html *` matches the body but never the root, so a floor on `html`
+  // kept the canvas white behind the app's own dark UI: half-light, half-dark page.
+  // A floor on `body` still whitens the canvas for a genuinely light page (a
+  // transparent html propagates the body background) and loses to the app's rule.
+  const dir = stage({
+    "popup/popup.html": '<html><head><link rel="stylesheet" href="popup.css"></head><body><script src="popup.js"></script></body></html>',
+    "popup/popup.css": "body{width:380px}",
+  });
+  injectShimIntoHtmlPages(dir);
+  const html = readFileSync(join(dir, "popup/popup.html"), "utf-8");
+  const style = /<style id="c2s-color-scheme">([^<]*)<\/style>/.exec(html)?.[1];
+  assert.ok(style, "light page must still get the floor");
+  assert.match(style, /(^|[;{}])body\{background-color:#fff/);
+  assert.doesNotMatch(style, /html\s*[,{]/, "the floor must not paint html — it becomes unbeatable");
+});
+
+test("root-absolute stylesheet href resolves from the staged root", () => {
+  const dir = stage({
+    "options/options.html": '<html><head><link rel="stylesheet" href="/css/app.css"></head><body></body></html>',
+    "css/app.css": "@media (prefers-color-scheme: dark){body{color:#fff}}",
+  });
+  injectShimIntoHtmlPages(dir);
+  const html = readFileSync(join(dir, "options/options.html"), "utf-8");
+  assert.ok(!/c2s-color-scheme/.test(html), "a root-absolute stylesheet must be read from the staged root");
+});
+
+test("remote stylesheets are not fetched and do not count as theme handling", () => {
+  const dir = stage({
+    "page.html": '<html><head><link rel="stylesheet" href="https://cdn.example.com/app.css"><link rel="stylesheet" href="//cdn.example.com/b.css"></head><body></body></html>',
+  });
+  injectShimIntoHtmlPages(dir);
+  const html = readFileSync(join(dir, "page.html"), "utf-8");
+  assert.match(html, /color-scheme:light/);
+});
+
 test("injection is idempotent — re-running adds no duplicate color-scheme", () => {
   const dir = stage({
     "page.html": "<html><head><title>x</title></head><body></body></html>",

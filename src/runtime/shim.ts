@@ -190,13 +190,14 @@ function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
 const COLOR_SCHEME_MARKER = "c2s-color-scheme";
 
 /**
- * Does the page (or the stylesheets it links from the same staged dir) handle dark
- * mode itself? A page that declares `color-scheme` or has any `prefers-color-scheme`
- * media query is theme-aware and must be left alone. Everything else is a
- * light-only page: Chrome renders extension pages light regardless of the OS theme,
- * but Safari honors the OS dark mode — so a light-only page gets a dark default text
- * color over its explicit `background:white` islands and goes white-on-white (live:
- * "Chrome extension source viewer" file list is invisible in Safari dark mode).
+ * Does the page (or a stylesheet it links) handle dark mode itself? A page that
+ * declares `color-scheme` or has any `prefers-color-scheme` media query is
+ * theme-aware and must be left alone. Everything else is treated as a light page:
+ * Chrome renders extension pages light regardless of the OS theme, but Safari honors
+ * the OS dark mode — so a page that relied on Chrome's white default gets a dark
+ * default text color over its explicit `background:white` islands and goes
+ * white-on-white (live: "Chrome extension source viewer" file list is invisible in
+ * Safari dark mode).
  */
 function pageHandlesDarkMode(dir: string, htmlFile: string, html: string): boolean {
   const declaresTheme = (css: string): boolean =>
@@ -204,14 +205,19 @@ function pageHandlesDarkMode(dir: string, htmlFile: string, html: string): boole
   if (declaresTheme(html)) return true;
   // Also honor a <meta name="color-scheme"> the page already ships.
   if (/<meta[^>]+name\s*=\s*["']color-scheme["']/i.test(html)) return true;
-  // Read every same-dir stylesheet the page links (skip absolute/remote hrefs).
+  // Read every stylesheet the page links from the staged tree (skip remote hrefs).
+  // A root-absolute href resolves from the extension root, not the page's directory —
+  // extension pages routinely link "/css/app.css", and joining that onto the page dir
+  // pointed at a file that does not exist, so the stylesheet went unread.
   const linkRe = /<link\b[^>]*\brel\s*=\s*["']?stylesheet["']?[^>]*>/gi;
   const hrefRe = /\bhref\s*=\s*["']([^"']+)["']/i;
   let m: RegExpExecArray | null;
   while ((m = linkRe.exec(html)) !== null) {
     const href = hrefRe.exec(m[0])?.[1];
-    if (!href || /^(https?:)?\/\//i.test(href) || href.startsWith("data:")) continue;
-    const cssPath = join(dirname(htmlFile), href.split("?")[0].split("#")[0]);
+    if (!href || /^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(href) || href.startsWith("data:")) continue;
+    const ref = href.split("?")[0].split("#")[0];
+    if (!ref) continue;
+    const cssPath = ref.startsWith("/") ? join(dir, ref.slice(1)) : join(dirname(htmlFile), ref);
     try {
       if (declaresTheme(readFileSync(cssPath, "utf-8"))) return true;
     } catch {
@@ -227,18 +233,29 @@ export function injectShimIntoHtmlPages(dir: string, polyfillFile?: string): num
   let count = 0;
   for (const file of walkHtmlFiles(dir)) {
     let html = readFileSync(file, "utf-8");
-    // A light-only page needs Chrome's light rendering. `color-scheme:light` alone
-    // is not enough: Safari sets the scheme but leaves the canvas transparent and
-    // the DEFAULT text color light, so a page that never set its own body
+    // A light page needs Chrome's light rendering. `color-scheme:light` alone is not
+    // enough: Safari sets the scheme but leaves the canvas transparent and the
+    // DEFAULT text color light, so a page that never set its own body
     // background/color (it relied on Chrome's white default) ends up white text on a
     // transparent body over Safari's dark window — invisible, with transparent panes
     // showing through as black (live: crxviewer source pane). Chrome's UA default for
     // an extension page is white bg + black text; replicate it, but only as a FLOOR
     // (no !important) so any explicit color the page's own CSS sets still wins.
     // Theme-aware pages are detected and left untouched.
+    //
+    // The floor paints `body`, NOT `html`. An extension that themes itself from
+    // JavaScript (TWP's popup appends `html *{background-color:#181a1b!important}`
+    // when it reads a dark `prefers-color-scheme`; Bitwarden and Tampermonkey ship
+    // their theme CSS inside the app bundle) looks like a light page here, because
+    // nothing in its markup or linked CSS mentions a color scheme. A floor on `html`
+    // is unbeatable in that case — `html *` matches the body, never the root — so the
+    // canvas stayed white behind the app's own dark UI and the page rendered half
+    // light, half dark. On `body` the same rule still whitens the canvas for a real
+    // light page (a transparent `html` propagates the body background to the canvas),
+    // and the app's own dark rule wins the moment it lands.
     const csTag =
       !html.includes(COLOR_SCHEME_MARKER) && !pageHandlesDarkMode(dir, file, html)
-        ? `<style id="${COLOR_SCHEME_MARKER}">:root{color-scheme:light;}html,body{background-color:#fff;color:#000;}</style>`
+        ? `<style id="${COLOR_SCHEME_MARKER}">:root{color-scheme:light;}body{background-color:#fff;color:#000;}</style>`
         : "";
     // Insert only the missing tag(s) so a partial prior injection (any tag)
     // never produces duplicates. Polyfill stays before the shim.
