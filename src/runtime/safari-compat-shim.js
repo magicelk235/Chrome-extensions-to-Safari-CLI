@@ -3576,8 +3576,30 @@ var __C2S_DEBUG__ = false;
         };
         var __sanitizePatterns = function (arr) {
           if (!Array.isArray(arr)) return arr;
-          var out = arr.filter(__okPattern);
+          var out = arr.filter(__okPattern).map(function (p) {
+            // Safari's pattern parser rejects a host component on file patterns
+            // ("'file://*/*' is not a valid pattern" — TWP registers it, live in the
+            // unified log). Chrome treats file://*/ and file:/// as the same "any
+            // local file"; rewrite to the hostless form Safari parses.
+            return /^file:\/\/\*\//i.test(p) ? p.replace(/^file:\/\/\*\//i, "file:///") : p;
+          });
           return out.length ? out : undefined; // empty array would itself be invalid
+        };
+        // Safari (current) rejects Chrome's MV2-era context aliases with a throw that
+        // aborts the create ("'page_action' is not a valid context" — TWP, live in the
+        // unified log). Upstream WebKit now maps both aliases to Action; do the same
+        // mapping here. "launcher" is Chrome-only (Chrome OS) and has no Safari
+        // surface, so a launcher-only item is skipped rather than thrown on.
+        var __sanitizeContexts = function (arr) {
+          if (!Array.isArray(arr)) return arr;
+          var out = [];
+          for (var ci = 0; ci < arr.length; ci++) {
+            var c = arr[ci];
+            if (c === "page_action" || c === "browser_action") c = "action";
+            if (c === "launcher") continue;
+            if (out.indexOf(c) < 0) out.push(c);
+          }
+          return out.length ? out : undefined;
         };
         var __wrapMenuCreate = function (props, cb) {
           if (props && typeof props === "object") {
@@ -3587,6 +3609,12 @@ var __C2S_DEBUG__ = false;
               var __copy = {}; for (var __ck in props) __copy[__ck] = props[__ck]; props = __copy;
               if ("targetUrlPatterns" in props) props.targetUrlPatterns = __sanitizePatterns(props.targetUrlPatterns);
               if ("documentUrlPatterns" in props) props.documentUrlPatterns = __sanitizePatterns(props.documentUrlPatterns);
+              if ("contexts" in props) {
+                props.contexts = __sanitizeContexts(props.contexts);
+                // A contexts array that sanitized to nothing means the item only
+                // existed for surfaces Safari doesn't have; register nothing.
+                if (props.contexts === undefined) return undefined;
+              }
               if (props.targetUrlPatterns === undefined) delete props.targetUrlPatterns;
               if (props.documentUrlPatterns === undefined) delete props.documentUrlPatterns;
             } catch (e) {}

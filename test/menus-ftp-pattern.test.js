@@ -36,7 +36,7 @@ function makeContext() {
   return { sandbox, created };
 }
 
-test("menus.create strips ftp:// from documentUrlPatterns, keeps http/https/file", () => {
+test("menus.create strips ftp://, rewrites host-wildcard file://, keeps http/https", () => {
   const { sandbox, created } = makeContext();
   sandbox.chrome.contextMenus.create({
     id: "translate",
@@ -45,7 +45,29 @@ test("menus.create strips ftp:// from documentUrlPatterns, keeps http/https/file
   assert.equal(created.length, 1);
   const patterns = created[0].documentUrlPatterns;
   assert.ok(!patterns.includes("ftp://*/*"), "ftp:// must be stripped");
-  assert.deepEqual(patterns, ["http://*/*", "https://*/*", "file://*/*"]);
+  // Safari's parser rejects a host component on file patterns ("'file://*/*' is
+  // not a valid pattern", live in the unified log); the hostless form is the same
+  // "any local file" match and parses.
+  assert.deepEqual(patterns, ["http://*/*", "https://*/*", "file:///*"]);
+});
+
+test("menus.create maps page_action/browser_action contexts to action, drops launcher", () => {
+  const { sandbox, created } = makeContext();
+  sandbox.chrome.contextMenus.create({
+    id: "pa",
+    contexts: ["page_action", "browser_action", "launcher", "page"],
+  });
+  assert.equal(created.length, 1);
+  // Safari throws "'page_action' is not a valid context" (live: TWP). Upstream
+  // WebKit maps both MV2 aliases to Action; the shim mirrors that, deduplicated.
+  assert.deepEqual(Array.from(created[0].contexts), ["action", "page"]);
+});
+
+test("menus.create registers nothing when every context is Safari-less", () => {
+  const { sandbox, created } = makeContext();
+  const id = sandbox.chrome.contextMenus.create({ id: "l", contexts: ["launcher"] });
+  assert.equal(created.length, 0);
+  assert.equal(id, undefined);
 });
 
 test("menus.create drops documentUrlPatterns entirely when only ftp was present", () => {
