@@ -4879,33 +4879,130 @@ var __C2S_DEBUG__ = false;
       // resolves undefined with no lastError, and nothing is delivered (live: TWP's
       // translateHTML on its webRequest-holding MV3 background). The global bindings
       // MUST keep the native object; see Safari-Quirks E15.
-      function sanitizeArgs(args) {
+      // WebKit's webRequest labels SUBFRAME document loads "main_frame": frameId is
+      // the raw 64-bit FrameIdentifier (nonzero; live: 30064771073 for an ad iframe,
+      // parentFrameId 4294967298), while Chrome's main_frame ALWAYS has frameId 0.
+      // Bundles that gate top-level-navigation logic on type === "main_frame"
+      // therefore treat every ad iframe's document load as the tab navigating —
+      // uBlock's strict-block interstitial hijacked the tab on w3schools when an ad
+      // frame loaded. Normalize at dispatch: the impossible-in-Chrome shape
+      // (main_frame + nonzero frameId) reaches the listener as sub_frame on a
+      // shallow CLONE; the native details object is never mutated, and every other
+      // field passes through as Safari gave it (parentFrameId included — the real
+      // parent is not resolvable at onBeforeRequest time; webNavigation reports it
+      // correctly, webRequest does not).
+      // WebKit materializes each webRequest event as a LAZY wrapper object and keeps
+      // no strong reference to it: once GC collects the wrapper, the expando
+      // addListener override installed below is collected with it, and the next
+      // property access materializes a fresh, pristine wrapper. Measured live: every
+      // event audited sanitized at init and native again 5s later, same webRequest
+      // object throughout — which is how uBlock's late onResponseStarted registration
+      // (after filter lists load) bypassed the patch while its boot-time
+      // onBeforeRequest registration kept it. Pin every patched event for the life
+      // of the context so the override survives GC.
+      var pinnedEvents = [];
+      var frameNormalized = typeof WeakMap === "function" ? new WeakMap() : null;
+      function normalizeListener(cb) {
+        if (typeof cb !== "function" || frameNormalized === null) return cb;
+        var wrapped = frameNormalized.get(cb);
+        if (wrapped) return wrapped;
+        wrapped = function (d) {
+          var args = arguments;
+          try {
+            if (d && d.type === "main_frame" && typeof d.frameId === "number" && d.frameId !== 0) {
+              args = [].slice.call(arguments);
+              args[0] = Object.assign({}, d, { type: "sub_frame" });
+            }
+          } catch (e) { args = arguments; } // normalization must never eat a dispatch
+          return cb.apply(this, args);
+        };
+        frameNormalized.set(cb, wrapped);
+        return wrapped;
+      }
+      // The native event holds the wrapper, the bundle holds its own function;
+      // removeListener/hasListener must translate or removal silently no-ops.
+      function mapArg0(orig) {
+        var wrapped = function () {
+          var args = [].slice.call(arguments);
+          if (frameNormalized !== null && typeof args[0] === "function") {
+            var w = frameNormalized.get(args[0]);
+            if (w) args[0] = w;
+          }
+          return orig.apply(this, args);
+        };
+        wrapped.__c2sArg0Mapped = true;
+        return wrapped;
+      }
+      // Same adaptive instance-then-prototype install as addListener below; the
+      // WeakMap gate keeps the prototype wrapper transparent for listeners the
+      // sanitizer never wrapped (non-webRequest events sharing the prototype).
+      function patchMapped(native, name) {
+        try {
+          var orig = native[name];
+          if (typeof orig === "function" && !orig.__c2sArg0Mapped) {
+            installOverride(native, name, mapArg0(orig));
+          }
+          // The prototype patch is the durable one — a fresh WebKit wrapper carries
+          // no instance expando (see sanitizeAdd) but inherits from this prototype.
+          var proto = Object.getPrototypeOf(native);
+          while (proto && !Object.prototype.hasOwnProperty.call(proto, name)) proto = Object.getPrototypeOf(proto);
+          if (!proto || typeof proto[name] !== "function" || proto[name].__c2sArg0Mapped) return;
+          installOverride(proto, name, mapArg0(proto[name]));
+        } catch (e) {}
+      }
+      // certainWebRequest: a bare event instance we took from chrome.webRequest is
+      // always one of ours — normalize its listener unconditionally. On a SHARED
+      // wrapper prototype only a RequestFilter registration (args[1].urls) is
+      // certainly webRequest; everything else stays untouched, same transparency
+      // rule the url filter already follows.
+      function sanitizeArgs(args, certainWebRequest) {
         var f = args[1];
-        if (f && Array.isArray(f.urls)) {
+        var hasUrls = f && Array.isArray(f.urls);
+        if (hasUrls) {
           var kept = f.urls.filter(function (u) {
             return u === "<all_urls>" || VALID_URL_PATTERN.test(String(u));
           });
           if (kept.length === 0) return null; // only unwatchable schemes → inert
           if (kept.length !== f.urls.length) args[1] = Object.assign({}, f, { urls: kept });
         }
+        if (certainWebRequest || hasUrls) args[0] = normalizeListener(args[0]);
         return args;
       }
       function sanitizeAdd(native) {
+        // Pin the event wrapper: WebKit holds it weakly, and losing it to GC loses
+        // any own-property override with it (see the header comment above).
+        if (native) pinnedEvents.push(native);
         if (!native || typeof native.addListener !== "function") return;
-        var origAdd = native.addListener;
-        if (origAdd.__c2sUrlSanitized) return;
-        var wrapped = function () {
-          var args = sanitizeArgs([].slice.call(arguments));
-          if (!args) return undefined;
-          return origAdd.apply(this === wrapped || this === undefined ? native : this, args);
-        };
-        wrapped.__c2sUrlSanitized = true;
-        // In-place on the instance first (same move the storage relay proved on
-        // runtime.onMessage).
-        if (installOverride(native, "addListener", wrapped) && native.addListener === wrapped) return;
-        // Frozen instance: patch the shared wrapper prototype that actually holds
-        // the method. The wrapper stays transparent for events whose addListener
-        // never takes a RequestFilter (args[1].urls is the discriminator).
+        var resolved = native.addListener;
+        var ownFlagged = Object.prototype.hasOwnProperty.call(native, "addListener") && resolved.__c2sUrlSanitized;
+        if (!ownFlagged) {
+          patchMapped(native, "removeListener");
+          patchMapped(native, "hasListener");
+          // A later event may resolve addListener through the already-patched
+          // prototype; unwrap to the raw native so the instance wrapper (certain
+          // path, filterless registrations included) doesn't sanitize twice.
+          var origAdd = (resolved.__c2sUrlSanitized && resolved.__c2sRaw) ? resolved.__c2sRaw : resolved;
+          var wrapped = function () {
+            var args = sanitizeArgs([].slice.call(arguments), true);
+            if (!args) return undefined;
+            return origAdd.apply(this === wrapped || this === undefined ? native : this, args);
+          };
+          wrapped.__c2sUrlSanitized = true;
+          wrapped.__c2sRaw = origAdd;
+          // In-place on the instance first (same move the storage relay proved on
+          // runtime.onMessage).
+          installOverride(native, "addListener", wrapped);
+        }
+        // ALWAYS also patch the shared wrapper prototype, even when the instance
+        // took the override. The instance patch dies with wrapper churn: pinning
+        // keeps OUR wrapper alive, but WebKit's weak wrapper cache can still hand a
+        // later property access a FRESH event object with no expando — measured
+        // live, uBlock's post-boot onResponseStarted registration reached the
+        // native addListener while the pinned boot-time wrapper stayed patched.
+        // Fresh wrappers inherit from this same prototype, so the prototype patch
+        // is the one that survives. It stays transparent for events whose
+        // addListener never takes a RequestFilter (args[1].urls is the
+        // discriminator).
         try {
           var proto = Object.getPrototypeOf(native);
           while (proto && !Object.prototype.hasOwnProperty.call(proto, "addListener")) proto = Object.getPrototypeOf(proto);
@@ -4913,15 +5010,18 @@ var __C2S_DEBUG__ = false;
           var protoAdd = proto.addListener;
           if (typeof protoAdd !== "function" || protoAdd.__c2sUrlSanitized) return;
           var protoWrapped = function () {
-            var args = sanitizeArgs([].slice.call(arguments));
+            var args = sanitizeArgs([].slice.call(arguments), false);
             if (!args) return undefined;
             return protoAdd.apply(this, args);
           };
           protoWrapped.__c2sUrlSanitized = true;
-          // If the prototype refuses too, leave everything NATIVE. An unsanitized
-          // addListener can throw on a bad pattern, which aborts one call;
-          // republishing the root aborts every message the context would receive.
+          protoWrapped.__c2sRaw = protoAdd;
+          // If the prototype refuses, the instance override (where it landed) still
+          // covers boot-time registrations; an unsanitized late addListener can
+          // throw on a bad pattern, which aborts one call — republishing the root
+          // would abort every message the context receives, so never do that.
           installOverride(proto, "addListener", protoWrapped);
+          pinnedEvents.push(proto);
         } catch (e) {}
       }
       var evNames = ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders",
