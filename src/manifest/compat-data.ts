@@ -40,7 +40,7 @@ export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
   topSites: "chrome.topSites is unsupported; shim returns an empty list.",
   search: "chrome.search is unsupported; shim opens queries in a search-engine tab.",
   declarativeContent: "declarativeContent rules never fire in Safari; use content scripts + chrome.action.",
-  userScripts: "The shim emulates chrome.userScripts registration (register/update/getScripts/unregister); dynamic injection of new scripts at runtime is not supported, so declare content scripts statically or use chrome.scripting where injection must actually run.",
+  userScripts: "The shim fully emulates chrome.userScripts: registered scripts are published to storage and injected on every matching page by a generated content script running in the isolated world. Remaining gaps: injection cannot honor document_start timing, and Chrome's USER_SCRIPT-world CSP exemption does not apply.",
   idle: "chrome.idle is unsupported; shim derives state from page visibility.",
   instanceID: "instanceID push plumbing is Chrome-only; use APNs natively or poll.",
   // ChromeOS-only APIs — always drop on Safari.
@@ -280,8 +280,8 @@ export const UNSUPPORTED_APIS: Record<
   },
   "chrome.userScripts": {
     severity: "warning",
-    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip), but the scripts are NOT actually injected, because WebKit has no dynamic user-world API.",
-    fix: "For real injection, statically declare content scripts or use chrome.scripting.",
+    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip) and registered scripts ARE injected — the registry is published to storage and a generated content script evaluates matching scripts in the isolated world on each page.",
+    fix: "Remaining fidelity gaps: document_start timing is not honored, and Chrome's USER_SCRIPT-world CSP exemption does not apply; use static content scripts or chrome.scripting if either matters.",
   },
   "chrome.idle": {
     severity: "info",
