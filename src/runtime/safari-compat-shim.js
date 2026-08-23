@@ -772,12 +772,16 @@ var __C2S_DEBUG__ = false;
     // Safari reports sender.origin with a LOWERCASE UUID host, and getURL("") is lowercased
     // for the empty arg above, so a bundle gating its own pages with
     //   sender.origin === getURL("").slice(0, -1)          // uBlock, verbatim
-    // already matches on Safari with no rewrite. This alignment is for browsers where the
-    // sender is mutable and the cases still differ; on Safari it's a no-op.
+    // already matches on Safari when origin is populated. Port senders may carry NO origin
+    // at all — then the bundle's url-startsWith fallback compares Safari's UPPERCASE
+    // sender.url against the lowercase base and is deterministically false. Chrome always
+    // populates sender.origin, so synthesize it here. Reachable only past the own-origin
+    // guard above — a content script's http(s) sender never gets our origin.
     var origin;
     try { origin = sender.origin; } catch (e) {}
-    var fixOrigin = typeof origin === "string" && origin !== canon &&
-      origin.toLowerCase() === canon.toLowerCase();
+    var fixOrigin = origin === undefined ||
+      (typeof origin === "string" && origin !== canon &&
+       origin.toLowerCase() === canon.toLowerCase());
     if (cut === url.length && !fixOrigin) return sender; // already normal → no clone needed
     // Safari's sender is a frozen exotic getter (an in-place rewrite of url or origin
     // doesn't stick — proven live), so hand the listener a shallow clone: copy every own
@@ -801,6 +805,80 @@ var __C2S_DEBUG__ = false;
     try { obj[name] = fn; if (obj[name] === fn) return true; } catch (e) {}
     try { Object.defineProperty(obj, name, { value: fn, writable: true, configurable: true }); if (obj[name] === fn) return true; } catch (e) {}
     return false;
+  }
+  // Safari hands onConnect listeners a Port whose `sender` is a read-only exotic getter,
+  // so the corrected sender clone has nowhere to land: the message path passes its clone
+  // as an ARGUMENT (fn.call(this, msg, sender, reply)), the port path only has a property
+  // it can't write. Bundles privilege-gate their own pages at connect time on exactly that
+  // sender — `origin === getURL('').slice(0,-1)`, url-startsWith fallback (uBlock,
+  // verbatim) — so when neither assignment nor defineProperty lands, hand the listener a
+  // wrapper that delegates everything to the native port and differs in `sender` alone.
+  // Memoized per native port so every listener in one dispatch sees ONE object.
+  var portWraps = (typeof WeakMap === "function") ? new WeakMap() : null;
+  var portWrapPairs = [];
+  function cachedWrap(port) {
+    if (portWraps) { try { return portWraps.get(port) || null; } catch (e) { return null; } }
+    for (var i = 0; i < portWrapPairs.length; i++) if (portWrapPairs[i][0] === port) return portWrapPairs[i][1];
+    return null;
+  }
+  function cacheWrap(port, w) {
+    if (portWraps) { try { portWraps.set(port, w); return; } catch (e) {} }
+    portWrapPairs.push([port, w]);
+  }
+  // Facade over a native port event that substitutes the wrapper for the native port in
+  // the argument slot Chrome puts it in (onMessage: 2nd, onDisconnect: 1st), so a bundle
+  // keying a Map (or the shim's own indexOf bookkeeping) by the object onConnect gave it
+  // still matches on disconnect. Keeps fn->wrapper pairs so removeListener/hasListener
+  // translate the caller's original reference.
+  function portEventFacade(ev, swap) {
+    if (!ev || typeof ev.addListener !== "function") return ev;
+    var pairs = [];
+    var find = function (fn) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) return pairs[i][1]; return null; };
+    return {
+      addListener: function (fn) {
+        if (typeof fn !== "function") return ev.addListener(fn);
+        var w = find(fn);
+        if (!w) { w = swap(fn); pairs.push([fn, w]); }
+        return ev.addListener(w);
+      },
+      removeListener: function (fn) {
+        var w = find(fn);
+        if (w) { for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === fn) { pairs.splice(i, 1); break; } }
+        if (typeof ev.removeListener === "function") return ev.removeListener(w || fn);
+      },
+      hasListener: function (fn) {
+        if (typeof ev.hasListener !== "function") return false;
+        return ev.hasListener(find(fn) || fn);
+      }
+    };
+  }
+  function portWithSender(port, sender) {
+    var hit = cachedWrap(port);
+    if (hit) return hit;
+    var w = {};
+    // Carry every other member across, natives bound to the real port so `this` survives.
+    try {
+      for (var k in port) {
+        if (k === "sender" || k === "onMessage" || k === "onDisconnect") continue;
+        var v; try { v = port[k]; } catch (e) { continue; }
+        try { w[k] = (typeof v === "function") ? v.bind(port) : v; } catch (e) {}
+      }
+    } catch (e) {}
+    try { w.name = port.name; } catch (e) {}
+    // Plain writable data property: uBlock clears it (`port.sender = undefined`) right
+    // after reading it, from a strict-mode module — a read-only slot would throw inside
+    // its onConnect handler.
+    w.sender = sender;
+    w.postMessage = function (m) { return port.postMessage(m); };
+    w.disconnect = function () { return port.disconnect(); };
+    w.onMessage = portEventFacade(port.onMessage, function (fn) {
+      return function (msg, p) { return fn.call(this, msg, p === port ? w : p); };
+    });
+    w.onDisconnect = portEventFacade(port.onDisconnect, function (fn) {
+      return function (p) { return fn.call(this, p === port ? w : p); };
+    });
+    cacheWrap(port, w);
+    return w;
   }
   // Canonicalize sender.origin on incoming connections/messages. Some extensions
   // privilege-gate their own pages with `sender.origin === getURL('').slice(0,-1)`; on a
@@ -844,17 +922,44 @@ var __C2S_DEBUG__ = false;
     };
     wrapEvent(rt.onConnect, function (fn) {
       return function (port) {
+        var out = port;
         try {
           if (port) {
-            fixSenderOrigin(port.sender, canon);
-            // Swap in a query-stripped sender clone for port-based allow-lists (Grammarly
-            // et al. gate on port.sender.url). Port is usually extensible even when its
-            // .sender is frozen; if the field is read-only the assignment no-ops silently.
-            var fixedS = senderWithFixedUrl(port.sender, canon);
-            if (fixedS !== port.sender) { try { port.sender = fixedS; } catch (e) {} }
+            var already = cachedWrap(port);
+            if (already) { out = already; }            // second listener, same dispatch
+            else {
+              // In-place attempt on a direct read: where port.sender returns the ONE real
+              // object (mutable-sender browsers) this lands, and the snapshot below then
+              // reads back already-canonical → no clone, native port through untouched.
+              fixSenderOrigin(port.sender, canon);
+              // Snapshot ONCE for the clone decision, and compare the clone against that
+              // same snapshot: Safari's exotic getter returns a fresh object per read, so
+              // a second read never matches and a content-script port (which must pass
+              // through native and untouched) would get wrapped for nothing.
+              var s;
+              try { s = port.sender; } catch (e) {}
+              // Swap in a query-stripped, origin-canonicalized sender clone for port-based
+              // gates (Grammarly allow-lists on port.sender.url; uBlock privilege-gates on
+              // sender.origin). Try the native port in place first — assignment, then
+              // defineProperty (writable:true, NOT optional: bundles clear port.sender
+              // from strict-mode modules) — and only wrap when neither verifiably lands.
+              var fixed = senderWithFixedUrl(s, canon);
+              if (fixed && fixed !== s) {
+                var took = false;
+                try { port.sender = fixed; took = (port.sender === fixed); } catch (e) {}
+                if (!took) {
+                  try {
+                    Object.defineProperty(port, "sender",
+                      { value: fixed, writable: true, configurable: true, enumerable: true });
+                    took = (port.sender === fixed);
+                  } catch (e) {}
+                }
+                if (!took) out = portWithSender(port, fixed);
+              }
+            }
           }
         } catch (e) {}
-        return fn.call(this, port);
+        return fn.call(this, out);
       };
     });
     wrapEvent(rt.onMessage, function (fn) {
