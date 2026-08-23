@@ -12,7 +12,13 @@ try { __C2S_PROXY_CONFIG__ = __C2S_PROXY_CONFIG_JSON__; } catch (e) { __C2S_PROX
 var __C2S_CDP__; try { __C2S_CDP__ = !(__C2S_PROXY_CONFIG__ && __C2S_PROXY_CONFIG__.cdp === false); } catch (e) { __C2S_CDP__ = true; }
 // Flip to true to trace proxy/fetch decisions in Web Inspector. Off by default so
 // a shipped extension does not log every request URL to the user's console.
+// `viaduct --debug` flips the next line to true at staging time and splices the
+// persistent ring-buffer logger (debug-ring.js) over the marker line under it,
+// mirroring every gated trace into a persistent storage.local ring buffer (read
+// it with `viaduct --logs`). A release emit keeps the marker as this inert comment,
+// so no ring write path ever ships disabled-but-present.
 var __C2S_DEBUG__ = false;
+// __C2S_DEBUG_RING__
 (function () {
   "use strict";
   var api = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
@@ -1838,7 +1844,10 @@ var __C2S_DEBUG__ = false;
     // Diagnostic: pipe a line to the broker's ~/viaduct-cdp.log via the appex native
     // route (the same {op}+__c2sNM envelope the WS relay uses). Fire-and-forget; any gap
     // is swallowed. TEMPORARY — strip together with the broker "clog" op once confirmed.
-    var cdpLog = function (line) { return; // no-op: sendNativeMessage per command contends with the poll loop; broker-side log covers diagnosis
+    var cdpLog = function (line) {
+      // Ring tee: __C2S_DEBUG_WRITE__ exists only in --debug emits (see shim header).
+      try { if (typeof __C2S_DEBUG_WRITE__ === "function") __C2S_DEBUG_WRITE__(["[cdp] " + String(line)]); } catch (e) {}
+      return; // no-op below: sendNativeMessage per command contends with the poll loop; broker-side log covers diagnosis
       try {
         var api = (typeof chrome !== "undefined" ? chrome : (typeof browser !== "undefined" ? browser : null));
         if (!(api && api.runtime && api.runtime.sendNativeMessage)) return;
@@ -6335,7 +6344,7 @@ var __C2S_DEBUG__ = false;
     var g = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
     // Gated trace: silent unless __C2S_DEBUG__ is flipped on (see shim header).
     var DBG = (typeof __C2S_DEBUG__ !== "undefined") && __C2S_DEBUG__;
-    function dbg() { if (DBG) { try { console.log.apply(console, arguments); } catch (e) {} } }
+    function dbg() { if (DBG) { try { console.log.apply(console, arguments); } catch (e) {} try { if (typeof __C2S_DEBUG_WRITE__ === "function") __C2S_DEBUG_WRITE__(arguments); } catch (e) {} } }
 
     // ---- native-messaging proxy --------------------------------------------
     // Safari sets the request Origin to safari-web-extension://<uuid>, which an
@@ -7097,6 +7106,9 @@ var __C2S_DEBUG__ = false;
     // A block threw despite its own guards (almost always a write to a frozen
     // Safari native). Swallow so the prepended host script still runs; surface in
     // the Inspector only when debugging.
-    if (__C2S_DEBUG__) { try { console.warn("[c2s] shim aborted early:", __shimErr); } catch (e) {} }
+    if (__C2S_DEBUG__) {
+      try { console.warn("[c2s] shim aborted early:", __shimErr); } catch (e) {}
+      try { if (typeof __C2S_DEBUG_WRITE__ === "function") __C2S_DEBUG_WRITE__(["[c2s] shim aborted early: " + String((__shimErr && __shimErr.message) || __shimErr)]); } catch (e) {}
+    }
   }
 })();

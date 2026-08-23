@@ -209,7 +209,9 @@ export function convert(opts: ConvertOptions): ConvertResult {
         chromeOrigin: chromeId ? `chrome-extension://${chromeId}` : "",
         proxyHosts,
         cdp: needsCdpShim,
+        debug: opts.debug === true,
       });
+      if (opts.debug) ok("Debug build: shim tracing on, persisted to storage.local __viaduct_debug_log__ (read with viaduct --logs) — don't ship this build");
       const n = injectShimIntoHtmlPages(stageDir, polyfillFile);
       if (n > 0) ok(`Shim${polyfillFile ? " + polyfill" : ""} injected into ${n} HTML page(s)`);
       if (needsCdpShim) ok("chrome.debugger detected \u2192 enabled CDP emulation shim (kept scripting + <all_urls>)");

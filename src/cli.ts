@@ -14,6 +14,7 @@ import { LSREGISTER, uninstallFromSafari, listSafariExtensions } from "./build/i
 import { detectXcodeTeam, defaultBundleId, deriveAppName } from "./build/packager.js";
 import { verifyInSafari, verifySigning } from "./build/verify.js";
 import { isUrl, downloadExtension } from "./input/download.js";
+import { readDebugLog, formatDebugLog } from "./runtime/debug-logs.js";
 import type { Platforms } from "./types.js";
 
 // Option keys a config file may set. Mirrors the long-flag names in parseArgs so
@@ -24,7 +25,7 @@ const CONFIG_KEYS = [
   "output", "bundle-id", "app-name", "min-safari", "platforms", "ci",
   "zip", "no-build", "open-xcode", "install", "install-dir",
   "no-safari-restart", "background-launch", "team", "no-shim", "no-oauth-bridge", "keep-module",
-  "force", "strict", "verify", "clean",
+  "force", "strict", "verify", "clean", "debug",
 ] as const;
 
 // Boolean-typed config keys (mirror the `type: "boolean"` entries in parseArgs). A
@@ -32,7 +33,7 @@ const CONFIG_KEYS = [
 // JS and would silently flip the flag ON. The rest are string-typed.
 const BOOLEAN_CONFIG_KEYS = new Set<string>([
   "ci", "zip", "no-build", "open-xcode", "install", "no-safari-restart",
-  "background-launch", "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify", "clean",
+  "background-launch", "no-shim", "no-oauth-bridge", "keep-module", "force", "strict", "verify", "clean", "debug",
 ]);
 
 // Config keys that also have a short CLI alias. Used to detect "the user typed it on
@@ -130,6 +131,7 @@ USAGE
   viaduct --doctor                  # check local toolchain
   viaduct --list                    # list registered Safari Web Extensions
   viaduct --uninstall <AppName>     # remove a previously installed app
+  viaduct --logs <name>             # dump a --debug build's persisted debug log
 
 INPUT
   A .zip, .crx, .xpi, an unpacked extension directory, or a URL (type detected by magic bytes).
@@ -169,6 +171,11 @@ OPTIONS
       --no-shim             Do not generate/inject the compatibility shim
       --no-oauth-bridge     Do not wire the Safari OAuth/externally_connectable bridge
       --keep-module         Keep background.type:"module" (default strips it)
+      --debug               Emit the shim with debug tracing enabled. Traces persist to a
+                            bounded ring buffer (last 2000 entries, batched writes) in
+                            storage.local under __viaduct_debug_log__ — read it live from
+                            any extension console or afterwards with --logs. Dev builds
+                            only; never ship a --debug conversion.
       --force               Convert despite blocking errors
       --strict              Treat warnings as blocking too (CI gate). With --analyze,
                             exit 1 if any warning/error is present.
@@ -180,6 +187,9 @@ OPTIONS
       --doctor              Verify xcrun/packager/xcodebuild availability
       --list                List Safari Web Extensions registered with pluginkit
       --uninstall <name>    Remove the installed <name>.app + unregister it (use with --install-dir)
+      --logs <name>         Dump the persisted debug log of an installed --debug build.
+                            <name> matches the app name or bundle id; reads Safari's
+                            on-disk extension storage, so Safari can stay open.
   -q, --quiet               Suppress progress messages (warnings/errors still print)
   -v, --verbose             Verbose output
   -h, --help                Show this help
@@ -344,6 +354,8 @@ async function main(): Promise<void> {
         "no-shim": { type: "boolean", default: false },
         "no-oauth-bridge": { type: "boolean", default: false },
         "keep-module": { type: "boolean", default: false },
+        debug: { type: "boolean", default: false },
+        logs: { type: "string" },
         force: { type: "boolean", default: false },
         strict: { type: "boolean", default: false },
         analyze: { type: "boolean", default: false },
@@ -401,6 +413,22 @@ async function main(): Promise<void> {
     }
     process.exit(uninstallFromSafari(name, values["install-dir"]) ? 0 : 1);
   }
+  if (values.logs !== undefined) {
+    const query = values.logs.trim();
+    if (!query) {
+      fail('--logs needs an app name or bundle id (e.g. --logs "My Extension").');
+      process.exit(1);
+    }
+    try {
+      const { entries, dir } = readDebugLog(query);
+      info(`${entries.length} entries from ${dir}`);
+      if (entries.length > 0) console.log(formatDebugLog(entries));
+      process.exit(0);
+    } catch (e) {
+      fail((e as Error).message);
+      process.exit(1);
+    }
+  }
 
   const inputs = positionals;
   if (inputs.length === 0) {
@@ -429,6 +457,11 @@ async function main(): Promise<void> {
 
   if (values.verify && !values.install) {
     fail("--verify requires --install (it checks the installed extension).");
+    process.exit(2);
+  }
+
+  if (values.debug && values["no-shim"]) {
+    fail("--debug enables the shim's debug tracing; remove --no-shim.");
     process.exit(2);
   }
 
@@ -605,6 +638,7 @@ async function main(): Promise<void> {
         zip: values.zip,
         openXcode: values["open-xcode"],
         keepModuleBackground: values["keep-module"],
+        debug: values.debug,
       });
     } catch (e) {
       fail((e as Error).message);

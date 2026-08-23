@@ -19,6 +19,10 @@ export const SW_LIFECYCLE_FILENAME = "viaduct-sw-lifecycle.js";
 export const ACTION_HOTKEY_FILENAME = "__viaduct-hotkey.js";
 export const USERSCRIPTS_CS_FILENAME = "__viaduct-userscripts.js";
 export const CDP_KEEPALIVE_FILENAME = "viaduct-cdp-keepalive.js";
+// Spliced into the shim by shimSource() for --debug conversions only (it never
+// stages as its own file): the persistent ring-buffer logger behind the
+// __C2S_DEBUG__ gate.
+export const DEBUG_RING_FILENAME = "debug-ring.js";
 
 /**
  * Copy the bundled webextension-polyfill into the staged extension so Chrome code
@@ -76,6 +80,10 @@ export interface ShimConfig {
   proxyHosts?: string[];
   /** Install the chrome.debugger / CDP emulation block. convert.ts passes needsCdpShim; when omitted the shim block self-defaults ON (so direct shimSource() calls in tests keep it enabled). */
   cdp?: boolean;
+  /** Emit the shim with debug tracing enabled: the compiled-in __C2S_DEBUG__ gate
+   *  flipped on and the persistent ring-buffer logger spliced in (viaduct --debug).
+   *  Default off — the release shim carries no ring-buffer write path at all. */
+  debug?: boolean;
 }
 
 export function shimSource(config: ShimConfig = {}): string {
@@ -93,7 +101,16 @@ export function shimSource(config: ShimConfig = {}): string {
     hosts: config.proxyHosts || [],
     cdp: config.cdp !== false,
   }).replace(/[\u2028\u2029]/g, (c) => c === "\u2028" ? "\\u2028" : "\\u2029");
-  const runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
+  let runtime = readFileSync(join(RUNTIME_DIR, SHIM_FILENAME), "utf-8");
+  // --debug emit: flip the compiled-in trace gate and splice the ring-buffer
+  // logger over its marker line. Exact-string split/join, same style as the
+  // proxy-config token below — a release emit never sees the ring source, so no
+  // persistent-log write path can ship disabled-but-present.
+  if (config.debug) {
+    runtime = runtime
+      .split("var __C2S_DEBUG__ = false;").join("var __C2S_DEBUG__ = true;")
+      .split("// __C2S_DEBUG_RING__").join(readFileSync(join(RUNTIME_DIR, DEBUG_RING_FILENAME), "utf-8"));
+  }
   // split/join = global replace; the placeholder appears once today, but a stray
   // second occurrence must not survive as invalid JS (matches oauth-bridge.ts).
   return runtime.split("__C2S_PROXY_CONFIG_JSON__").join(proxyCfg);

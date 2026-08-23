@@ -91,6 +91,9 @@ export interface ConvertOptions {
   keepModuleBackground: boolean;
   /** Wire the Safari OAuth/externally_connectable bridge (default on). */
   oauthBridge?: boolean;
+  /** Emit the shim with debug tracing enabled and the persistent ring-buffer
+   *  logger installed (viaduct --debug). Dev builds only. */
+  debug?: boolean;
   /** Copy the built app into ~/Applications and register it with Safari. */
   install: boolean;
   /** Override the install target dir (default ~/Applications). */
