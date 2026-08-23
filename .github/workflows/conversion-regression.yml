@@ -1,0 +1,126 @@
+name: Conversion regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, typecheck, test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      # npm test rebuilds dist and runs the full node --test suite.
+      - run: npm test
+
+  corpus:
+    name: Corpus analyze
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Analysis itself is pure Node, but the converter's target toolchain lives
+      # here; catch a broken runner image before it shows up as a user report.
+      - name: Xcode sanity check
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --find safari-web-extension-converter
+
+      - run: npm ci
+      - run: npm run build
+
+      # The real extension corpus ("test extensions/") is local-only binaries and
+      # deliberately not committed, so CI analyzes small synthesized extensions
+      # covering both manifest generations instead.
+      - name: Synthesize sample corpus
+        run: |
+          corpus="$RUNNER_TEMP/corpus"
+          mkdir -p "$corpus/mv3-sample" "$corpus/mv2-sample"
+
+          cat > "$corpus/mv3-sample/manifest.json" <<'EOF'
+          {
+            "manifest_version": 3,
+            "name": "MV3 Sample",
+            "version": "1.0.0",
+            "description": "Minimal MV3 extension exercising the analyzer.",
+            "background": { "service_worker": "background.js" },
+            "action": { "default_popup": "popup.html" },
+            "permissions": ["storage", "tabs"],
+            "host_permissions": ["https://example.com/*"],
+            "content_scripts": [
+              { "matches": ["https://example.com/*"], "js": ["content.js"] }
+            ]
+          }
+          EOF
+          cat > "$corpus/mv3-sample/background.js" <<'EOF'
+          chrome.runtime.onInstalled.addListener(() => {
+            chrome.storage.local.set({ installed: Date.now() });
+          });
+          EOF
+          cat > "$corpus/mv3-sample/content.js" <<'EOF'
+          chrome.runtime.sendMessage({ type: "page", url: location.href });
+          EOF
+          cat > "$corpus/mv3-sample/popup.html" <<'EOF'
+          <!doctype html><html><body><p>Sample</p><script src="popup.js"></script></body></html>
+          EOF
+          cat > "$corpus/mv3-sample/popup.js" <<'EOF'
+          chrome.tabs.query({ active: true, currentWindow: true }, () => {});
+          EOF
+
+          cat > "$corpus/mv2-sample/manifest.json" <<'EOF'
+          {
+            "manifest_version": 2,
+            "name": "MV2 Sample",
+            "version": "1.0.0",
+            "description": "Minimal MV2 extension exercising the persistent-background rewrite.",
+            "background": { "scripts": ["background.js"], "persistent": true },
+            "browser_action": { "default_title": "Sample" },
+            "permissions": ["storage", "https://example.com/*"]
+          }
+          EOF
+          cat > "$corpus/mv2-sample/background.js" <<'EOF'
+          chrome.browserAction.onClicked.addListener(() => {
+            chrome.storage.local.set({ clicked: Date.now() });
+          });
+          EOF
+
+      # Gate on the analyze exit code plus the machine-readable verdict. --strict
+      # is intentionally not used: the MV2 fixture legitimately reports a warning
+      # (persistent background rewrite), and a warning-level gate would make every
+      # new advisory check a red build.
+      - name: Analyze corpus
+        run: |
+          set -euo pipefail
+          for ext in "$RUNNER_TEMP"/corpus/*/; do
+            name="$(basename "$ext")"
+            echo "::group::$name"
+            node dist/cli.js "$ext" --analyze --json > "$RUNNER_TEMP/$name.report.json"
+            node -e '
+              const fs = require("node:fs");
+              const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              if (!r.convertible || r.blocking !== 0) {
+                console.error("analyzer verdict regressed:", JSON.stringify({ convertible: r.convertible, blocking: r.blocking, counts: r.counts }));
+                process.exit(1);
+              }
+              console.log(`${r.name} MV${r.manifestVersion}: convertible, counts ${JSON.stringify(r.counts)}`);
+            ' "$RUNNER_TEMP/$name.report.json"
+            echo "::endgroup::"
+          done
