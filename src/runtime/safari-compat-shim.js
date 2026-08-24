@@ -7101,6 +7101,103 @@ var __C2S_DEBUG__ = false;
     } catch (e) { /* ignore */ }
   }
 
+  // ── Safari's popover cannot scroll its own main frame ────────────────────────
+  // A popup taller than the popover is simply cut off. Measured live on Replace AI
+  // Translator API (Safari 26): the popover viewport is 360x600 with a 989px
+  // document, and both window.scrollTo(0, 400) and documentElement.scrollTop = 400
+  // leave the offset at 0. Nothing throws, no scrollbar appears, the wheel does
+  // nothing, and everything past the first 600px is unreachable — on that popup the
+  // whole API-settings list.
+  //
+  // A NESTED scroller still scrolls, so hand the overflow to <body>: cap it at the
+  // viewport and let it scroll itself. Two details make that work:
+  //  - <html> must lose `overflow:visible`, or CSS propagates the BODY's overflow to
+  //    the viewport instead of applying it to the body box (css-overflow-3 §3.5) —
+  //    the body stays `visible` and nothing scrolls after all.
+  //  - The declarations go on element.style, not into an injected <style>: an
+  //    extension whose CSP omits 'unsafe-inline' for style-src blocks the tag, while
+  //    CSSOM writes are exempt from CSP. Inline `!important` also beats the app's own
+  //    sheet, which trapped popups need — they set body{overflow:hidden} because
+  //    Chrome's popup main frame scrolls for them.
+  //
+  // Gated twice so a popup that already lays out correctly is never touched: only the
+  // popover document, and only once the frame has PROVEN it cannot scroll a document
+  // that overflows it. Making <body> a scroll container costs something — an
+  // absolutely-positioned menu that used to grow the popover now scrolls inside it —
+  // so it must not reach popups that fit.
+  if (typeof window !== "undefined" && typeof document !== "undefined" && c2sIsPanelDoc()) {
+    try {
+      // Safari sizes the popover from the document, and it does so LATE: measured on
+      // this popup, the frame still reports a 1px viewport at DOMContentLoaded and
+      // only settles at 600 afterwards. So no verdict may be taken from a viewport
+      // that small — and the cap has to be a pixel value read off the settled frame,
+      // never `100vh`. With vh, the popover height feeds the body cap which feeds the
+      // document height which feeds the popover height: applied at 1px, that circle
+      // latched, the whole popup collapsed to a 1px sliver, and it never recovered.
+      var C2S_MIN_SANE_VIEWPORT = 80;
+      // "fits" = nothing overflows yet, so there is no verdict; "scrolls" = the frame
+      // moved; "trapped" = it overflows and refuses to move.
+      var c2sFrameScrollState = function () {
+        var h = document.documentElement;
+        if (!h || h.clientHeight < C2S_MIN_SANE_VIEWPORT) return "fits";
+        if (h.scrollHeight - h.clientHeight <= 1) return "fits";
+        var before = window.pageYOffset || h.scrollTop || 0;
+        if (before > 0) return "scrolls"; // already offset → it scrolls, don't poke it
+        try { window.scrollTo(0, h.scrollHeight); } catch (e) {}
+        if ((window.pageYOffset || h.scrollTop || 0) > 0) {
+          try { window.scrollTo(0, before); } catch (e) {}
+          return "scrolls";
+        }
+        return "trapped";
+      };
+      // Latches on the first real verdict: a frame that scrolls always will, and the
+      // rescue is applied at most once. Returns true when there is nothing left to
+      // watch for.
+      var c2sScrollVerdict = "";
+      var c2sRescueScroll = function () {
+        if (c2sScrollVerdict) return true;
+        if (!document.body) return false;
+        var state = c2sFrameScrollState();
+        if (state === "fits") return false;
+        c2sScrollVerdict = state;
+        if (state === "trapped") {
+          try {
+            // The popover's real ceiling, read off the settled frame.
+            var cap = document.documentElement.clientHeight;
+            document.documentElement.style.setProperty("overflow", "hidden", "important");
+            document.body.style.setProperty("max-height", cap + "px", "important");
+            document.body.style.setProperty("overflow-y", "auto", "important");
+          } catch (e) {}
+        }
+        return true;
+      };
+      // A popup's content usually arrives after load (i18n, a storage read, a
+      // framework render), so the document can outgrow the popover long after
+      // DOMContentLoaded — and the popover itself is sized later still. Watch both:
+      // ResizeObserver for the content growing, resize for Safari settling the frame
+      // (which changes no element box, so the observer never sees it).
+      var c2sWatchScroll = function () {
+        if (c2sRescueScroll()) return;
+        var onResize = function () { if (c2sRescueScroll()) stop(); };
+        var stop = function () { window.removeEventListener("resize", onResize); };
+        try {
+          if (typeof ResizeObserver === "function") {
+            var ro = new ResizeObserver(function () { if (c2sRescueScroll()) stop(); });
+            ro.observe(document.documentElement);
+            ro.observe(document.body);
+            stop = function () {
+              try { ro.disconnect(); } catch (e) {}
+              window.removeEventListener("resize", onResize);
+            };
+          }
+        } catch (e) {}
+        window.addEventListener("resize", onResize);
+      };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", c2sWatchScroll);
+      else c2sWatchScroll();
+    } catch (e) { /* ignore */ }
+  }
+
   // Content-script half of the webNavigation.onHistoryStateUpdated emulation above.
   // Safari delivers no navigation events to the background page, so the page itself
   // reports its own same-document navigations and the background re-emits them in the
