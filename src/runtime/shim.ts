@@ -1199,8 +1199,18 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
     let m: RegExpExecArray | null;
     while ((m = argRe.exec(argList))) {
       const literal = m[1] ?? m[2] ?? m[3]; // "…" | '…' | `…`
-      // Resolve relative to the worker's dir → a path from the extension root.
-      const fromRoot = join(resolveDir, literal).split("\\").join("/");
+      // importScripts resolves each URL against the worker's location, so a leading
+      // "/" is root-absolute — the extension root — while everything else is relative
+      // to the worker's own dir. join() collapses the two: join("src",
+      // "/src/lib/actions.js") is "src/src/lib/actions.js", which exists nowhere, so
+      // the target was dropped while the call was still neutralized. The background
+      // then came up with none of the libraries it imports and every message handler
+      // threw on the first missing global — live on Replace AI Translator API, whose
+      // popup could never read its settings (the background answered GET_STATE with
+      // {ok:false,error:"exception"}), so picking a provider did nothing. Only bites a
+      // worker in a subdirectory: join(".", "/a.js") normalizes to "a.js" by luck.
+      const fromRoot = (literal.startsWith("/") ? literal.slice(1) : join(resolveDir, literal))
+        .split("\\").join("/");
       // Unresolved → skip the tag; the no-op replacement still applies.
       if (existsSync(join(dir, fromRoot))) targets.push(fromRoot);
     }
