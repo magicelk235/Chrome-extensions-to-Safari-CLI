@@ -535,9 +535,9 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "info",
       category: "manifest",
-      message: "update_url ignored by Safari (App Store updates only); removing.",
+      message: "update_url is ignored by Safari (no auto-update from a manifest URL); kept in the manifest.",
       file: "manifest.json",
-      autoFixed: true,
+      fix: "The extension no longer updates itself, but the field stays because self-hosted bundles read it back at runtime.",
     });
   }
   if (!m.version || (typeof m.version === "string" && !m.version.trim())) {
@@ -946,13 +946,22 @@ export function transformManifest(
 ): Manifest {
   const out: Manifest = JSON.parse(JSON.stringify(m));
 
-  delete out.update_url;
   delete out.key;
   delete out.minimum_chrome_version;
   // Keep version_name: the App Store ignores it, but it's a real runtime field —
   // extensions read chrome.runtime.getManifest().version_name for display (Salesforce
   // Inspector renders it in its footer and crashes on undefined.replace if it's gone).
   // Harmless to leave in the Safari bundle; removing it breaks that read.
+  //
+  // Keep update_url for the same reason. Safari never fetches it, but a self-hosted
+  // bundle reads it back to learn that it updates itself, and the idiom is a chain of
+  // ORs across the browsers' update fields:
+  //   !!(manifest.update_url || (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.update_url))
+  // Deleting update_url makes that fall through to the Firefox operand, and since we
+  // ADD browser_specific_settings.safari (for strict_min_version) the object now exists
+  // without a `gecko` block — so the read throws at the top level of the background
+  // script and everything after it in that file never runs. Live: Bypass Paywalls Clean
+  // (background.js:260) registered no DNR rules and injected no content scripts at all.
 
   if (out.version) {
     // Safari/Xcode require dot-separated integers (max 3 components, each ≤ 65535).

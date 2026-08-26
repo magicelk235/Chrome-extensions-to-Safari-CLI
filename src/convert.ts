@@ -6,7 +6,7 @@ import type { ConvertOptions, ConvertResult, Issue } from "./types.js";
 import { extractExtension } from "./input/extract.js";
 import { loadManifest, analyzeManifest, transformManifest, writeManifest, resolveI18nString, collectReferencedPaths, raiseMinVersionForMainWorld, MAIN_WORLD_MIN_SAFARI_VERSION } from "./manifest/manifest.js";
 import { scanExtension } from "./analyze/analyze.js";
-import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
+import { stageExtension, stripDanglingSourcemaps, inlineImmutableEnums, rewriteRuntimeIdUrlMatchers, rewriteChromeSchemeLiterals, rewriteExtensionIdPlaceholderUrls, guardAncestorOriginsAccess, guardGeckoSettingsAccess, rewriteSelfPageExtensionUrls, rewriteBackgroundContextChecks, idempotentContentScriptGlobals, guardLocaleTailMessage } from "./input/stage.js";
 import { writeShim, writePolyfill, injectShimIntoHtmlPages, injectPopupSizing, convertServiceWorkerToBackgroundPage, wireActionClickBridge, wireActionHotkey, wirePageWorldMainInjection, wireUserScriptsContentScript, wireCdpKeepalive, deriveProxyHosts } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { applyDnr } from "./manifest/dnr.js";
@@ -187,6 +187,14 @@ export function convert(opts: ConvertOptions): ConvertResult {
     // sees "" (Salesforce Inspector Reloaded: blank action popup).
     const guardedAncestors = guardAncestorOriginsAccess(stageDir);
     if (guardedAncestors > 0) ok(`Guarded location.ancestorOrigins[0] reads in ${guardedAncestors} script(s)`);
+
+    // We add browser_specific_settings.safari for strict_min_version, so a bundle that
+    // reads its Firefox block through the container-only guard
+    // (`bss && bss.gecko.update_url`) now finds the container and throws on the missing
+    // `gecko`. At the top level of a background script that kills everything after it
+    // (Bypass Paywalls Clean registered zero DNR rules). Optional-chain the block.
+    const guardedGecko = guardGeckoSettingsAccess(stageDir);
+    if (guardedGecko > 0) ok(`Guarded browser_specific_settings.gecko reads in ${guardedGecko} script(s)`);
 
     // Safari drops the last entry of each _locales/<locale>/messages.json, so whatever
     // string happens to be last in the file resolves to "" and the extension renders

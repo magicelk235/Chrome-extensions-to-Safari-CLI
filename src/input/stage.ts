@@ -457,6 +457,50 @@ export function guardAncestorOriginsAccess(stageDir: string): number {
   return modified;
 }
 
+// A cross-browser bundle reads its FIREFOX settings block to decide whether it
+// self-hosts its own updates, and the idiom guards the container but not the block:
+//   manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.update_url
+// On Chrome `browser_specific_settings` is absent, so the `&&` short-circuits and the
+// `.gecko` read never happens. viaduct ADDS `browser_specific_settings.safari` (that is
+// the only place `strict_min_version` can live), so after conversion the container
+// exists with no `gecko` in it and the read throws.
+//
+// Where that lands decides how bad it is. At the top level of a background script it
+// kills every statement after it: Bypass Paywalls Clean (background.js:260) registered
+// none of its 802 DNR rules and injected no content scripts at all. Inside a promise it
+// is "only" an unhandled rejection that silently drops that feature (the same bundle's
+// update check, background.js:1843).
+//
+// Optional-chain the block so the read yields undefined instead of throwing:
+//   bss.gecko.update_url  ->  bss.gecko?.update_url
+// undefined is falsy, which is the honest answer on Safari ("no Firefox settings"), and
+// it keeps a `bss.gecko` presence test false — injecting an empty `gecko: {}` into the
+// manifest instead would flip such a test to true and send the bundle down its Firefox
+// path. Safari 13.1+ parses optional chaining, well under viaduct's 15.4 floor.
+//
+// Literal substitution, not a JS parser: the property name is distinctive enough that a
+// textual match cannot hit anything else, and `(?!\?)` keeps it idempotent.
+const GECKO_SETTINGS_RE = /(\bbrowser_specific_settings(?:\?)?\.gecko)\.(?!\?)/g;
+
+export function guardGeckoSettingsAccess(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!content.includes("browser_specific_settings")) continue;
+    const next = content.replace(GECKO_SETTINGS_RE, "$1?.");
+    if (next !== content) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
 // Safari re-evaluates a content-script group a SECOND time into a world that already
 // ran it. It happens for the document_end / document_idle groups on all_frames pages:
 // an about:blank / about:srcdoc subframe (and some same-origin navigations) shares the
