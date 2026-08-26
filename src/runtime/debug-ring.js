@@ -89,7 +89,7 @@ var __C2S_DEBUG_WRITE__ = (function () {
       pending = [];
       try { persist(batch); } catch (e) {}
     }
-    return function (args) {
+    var write = function (args) {
       try {
         var parts = [];
         for (var i = 0; i < args.length; i++) parts.push(fmt(args[i]));
@@ -98,6 +98,31 @@ var __C2S_DEBUG_WRITE__ = (function () {
         if (timer == null) timer = setTimeout(flush, FLUSH_MS);
       } catch (e) {}
     };
+    // An uncaught error in the HOST script is the single most useful thing to see
+    // and the hardest to reach: it aborts the rest of that script (a background
+    // page stops registering its listeners, a content script never runs) and the
+    // only record is a Web Inspector console nobody has open. Tee both failure
+    // channels into the ring so `--logs` shows them.
+    try {
+      var target = (typeof self !== "undefined" && self.addEventListener) ? self
+        : ((typeof window !== "undefined" && window.addEventListener) ? window : null);
+      if (target) {
+        target.addEventListener("error", function (e) {
+          try {
+            var m = (e && (e.message || (e.error && e.error.message))) || "error";
+            var at = (e && e.filename) ? " @" + e.filename + ":" + e.lineno + ":" + e.colno : "";
+            write(["[uncaught] " + m + at]);
+          } catch (e2) {}
+        });
+        target.addEventListener("unhandledrejection", function (e) {
+          try {
+            var r = e && e.reason;
+            write(["[unhandled rejection] " + ((r && (r.message || r)) || "unknown")]);
+          } catch (e2) {}
+        });
+      }
+    } catch (e) {}
+    return write;
   } catch (e) {
     return function () {};
   }
