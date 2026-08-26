@@ -91,7 +91,7 @@ test("a batch where nothing lands still rejects", async () => {
   assert.equal(s.applied.length, 0);
 });
 
-test("modifyHeaders rules are still stripped before the call", async () => {
+test("a modifyHeaders rule with no usable header edit is dropped before the call", async () => {
   const s = boot();
   await s.chrome.declarativeNetRequest.updateSessionRules({
     addRules: [
@@ -99,5 +99,5 @@ test("modifyHeaders rules are still stripped before the call", async () => {
       { id: 2, priority: 1, action: { type: "modifyHeaders" }, condition: { urlFilter: "*" } },
     ],
   });
-  assert.deepEqual(s.applied.map((r) => r.id), [1], "modifyHeaders crashes Safari's rule store");
+  assert.deepEqual(s.applied.map((r) => r.id), [1], "Safari rejects a modifyHeaders action with no header list");
 });

@@ -447,11 +447,14 @@ untested: [Tested Extensions][tested].
   host manifest or host binary in Safari; messages route to the containing macOS
   app instead. The analyzer flags it, and you implement the response in the app's
   `SafariWebExtensionHandler` (`beginRequest`).
-- `declarativeNetRequest` rules with a `modifyHeaders` action crash Safari's
-  WebKit rule loader, so the tool strips them, both from static rulesets and from
-  dynamic `updateSessionRules`/`updateDynamicRules` calls. Header-rewriting use
-  cases such as a CORS bypass are not converted; use a native-messaging proxy for
-  those. The tool also warns when static rulesets use `regexFilter`, since Safari
+- `declarativeNetRequest` `modifyHeaders` rules are dropped, from static rulesets
+  and from dynamic `updateSessionRules`/`updateDynamicRules` calls alike. Safari
+  accepts such a rule and then never applies it (verified against a live server,
+  with a `block` rule in the same call blocking correctly), and one header name off
+  WebKit's allowlist makes the whole update throw and takes the working rules with
+  it. Spoofing `user-agent`/`referer`, stripping `Cookie`, a CORS bypass or a
+  response-header rewrite all need a native-messaging proxy instead.
+  The tool also warns when static rulesets use `regexFilter`, since Safari
   supports only a limited regex subset and silently drops rules it cannot
   compile, and when the number of enabled rules exceeds what Safari honors, since
   the overflow is ignored.

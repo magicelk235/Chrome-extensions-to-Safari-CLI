@@ -5,7 +5,7 @@ import { parseJsonc } from "./manifest.js";
 
 // res.path comes from the extension's manifest.json — untrusted. A path like
 // "../../etc/x" would make join() resolve outside stageDir, and the modifyHeaders
-// strip below writeFileSync()s back to it: arbitrary file overwrite from a
+// rewrite below writeFileSync()s back to it: arbitrary file overwrite from a
 // malicious extension. Confirm the resolved path stays under stageDir.
 // String-prefix check via path.relative; fine for a local single root.
 function resolveInside(stageDir: string, p: string): string | null {
@@ -32,15 +32,40 @@ interface DnrRule {
 const SAFARI_STATIC_RULE_GUIDELINE = 30000;
 
 /**
+ * Drop `modifyHeaders` rules — Safari accepts them and then never acts on them.
+ *
+ * Measured on Safari 26.6.2 (macOS 26.6.2), converted extension with all-website
+ * access, rules registered against a public host and read back off the server:
+ *   - `updateSessionRules` and `updateDynamicRules` both RESOLVE for a header rule,
+ *     and `getSession/DynamicRules` list it back verbatim.
+ *   - The requests go out with Safari's own `User-Agent` and `Referer` regardless:
+ *     main-frame navigation, page-context XHR, subresources, session or dynamic.
+ *   - A `block` rule registered in the SAME call DID block, so the rule list is
+ *     compiled and applied — it is the header action specifically that is inert.
+ * WebKit has the plumbing (`ModifyHeadersAction::applyToRequest`), it just never
+ * reaches the request, and `responseHeaders` are not implemented at all (bug 263818).
+ *
+ * So the rules are dead weight, and worse than inert: they take up room in a rule
+ * store that has a cap, and a header name off WebKit's allowlist (`x-forwarded-for`,
+ * any custom `x-*`) makes `update{Session,Dynamic}Rules` throw *synchronously*, which
+ * takes down the extension's own registration code and every other rule in the batch.
+ * Drop them here and let the caller report the count.
+ *
+ * Revisit if WebKit starts applying the action: the rest of the pipeline needs no
+ * change, only this filter and its counterpart in the runtime shim.
+ */
+export function stripModifyHeaders(rules: unknown[]): { rules: unknown[]; dropped: number } {
+  const out = (rules as DnrRule[]).filter((r) => r?.action?.type !== "modifyHeaders");
+  return { rules: out, dropped: rules.length - out.length };
+}
+
+/**
  * Sanitize declarativeNetRequest for Safari and report anything dropped.
  *
- * Static rulesets: Safari (current WebKit) crashes the WHOLE browser when a DNR
- * ruleset contains a "modifyHeaders" action — reading the rule back from its
- * SQLite store null-derefs in WebExtensionContext::loadDeclarativeNetRequestRules
- * → getRulesWithRuleIDs (EXC_BAD_ACCESS). The runtime shim already strips such
- * rules from update{Session,Dynamic}Rules calls, but static rule_resources files
- * load straight from disk and never pass through the shim — so strip them here.
- * block/redirect/allow/upgradeScheme rules pass through untouched.
+ * Static rulesets: `modifyHeaders` rules are dropped, because Safari accepts them
+ * and never applies them (see `stripModifyHeaders`); every other action type passes
+ * through untouched. Static rule_resources load straight from disk and never reach
+ * the runtime shim, which drops the same rules out of dynamic and session updates.
  *
  * api.anthropic.com's org CORS gate keys on `sec-fetch-site`, a browser-controlled
  * forbidden header that JS cannot set and that Safari refuses to let DNR modify;
@@ -70,7 +95,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
     try {
       // Same lenient parse as the manifest: Chrome tolerates BOM/comments/trailing
       // commas in rule files, and a parse failure here would SKIP the modifyHeaders
-      // crash-strip below while Safari still loads the raw file.
+      // strip below while Safari still loads the raw file.
       rules = parseJsonc(readFileSync(file, "utf-8"));
     } catch {
       notes.push(`DNR ruleset "${id}" (${res.path}) is not valid JSON; Safari will fail to load it.`);
@@ -80,12 +105,14 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
       notes.push(`DNR ruleset "${id}" (${res.path}) is not a JSON array of rules; Safari will fail to load it.`);
       continue;
     }
-    const safe = (rules as DnrRule[]).filter((r) => r?.action?.type !== "modifyHeaders");
-    if (safe.length !== rules.length) {
+    const clean = stripModifyHeaders(rules);
+    const safe = clean.rules as DnrRule[];
+    if (clean.dropped) {
       writeFileSync(file, JSON.stringify(safe, null, 2) + "\n", "utf-8");
       notes.push(
-        `Stripped ${rules.length - safe.length} modifyHeaders rule(s) from DNR ruleset "${id}": ` +
-          "modifyHeaders crashes Safari's DNR rule store; other rules kept."
+        `Dropped ${clean.dropped} modifyHeaders rule(s) from DNR ruleset "${id}": Safari accepts header ` +
+          "rules and never applies them, and one off-allowlist header name makes the whole update throw. " +
+          "Other rules kept."
       );
     }
 
@@ -117,7 +144,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): string[] {
       : "Requires the nativeMessaging permission (NOT declared here; add it or the retry cannot reach the native host).";
     notes.push(
       "api.anthropic.com calls hit an org CORS gate that cannot be bypassed in-browser " +
-        "(no DNR modifyHeaders, which crashes Safari). The shim now retries blocked backend " +
+        "(the gate keys on sec-fetch-site, which is off Safari's DNR header allowlist). The shim now retries blocked backend " +
         "requests through the native host (SafariWebExtensionHandler), which sets the Chrome " +
         `Origin server-side. ${nmNote}`
     );

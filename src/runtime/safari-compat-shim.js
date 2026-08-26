@@ -34,6 +34,11 @@ var __C2S_DEBUG__ = false;
     try { var rt = (typeof chrome !== "undefined" && chrome.runtime); if (rt) rt.lastError = v; } catch (e) {}
   }
 
+  // Gated trace, shared by every block below: silent unless __C2S_DEBUG__ is
+  // flipped on (viaduct --debug, see the shim header), in which case it also
+  // mirrors into the persistent ring buffer when that logger was spliced in.
+  var DBG = (typeof __C2S_DEBUG__ !== "undefined") && __C2S_DEBUG__;
+  function dbg() { if (DBG) { try { console.log.apply(console, arguments); } catch (e) {} try { if (typeof __C2S_DEBUG_WRITE__ === "function") __C2S_DEBUG_WRITE__(arguments); } catch (e) {} } }
 
   // Publish a global `chrome` aliased to `browser` BEFORE anything else. Safari
   // exposes `browser` in extension pages/content scripts/background, but `chrome`
@@ -1145,8 +1150,8 @@ var __C2S_DEBUG__ = false;
   // backfill block. If the mutableNamespace clone fails and the `|| api.storage`
   // fallback hands back the frozen original, `__stg.sync = {…}` throws on Safari —
   // which without this catch would abort EVERY later patch (notifications, debugger,
-  // the whole namespace backfill, and the DNR modifyHeaders strip that prevents a
-  // Safari browser crash). Contain it.
+  // the whole namespace backfill, and the DNR sanitizer that keeps a header rule from
+  // taking down an extension's whole rule registration). Contain it.
   try {
   if (api.storage && api.storage.local &&
       (!api.storage.sync || typeof api.storage.sync.get !== "function")) {
@@ -5581,14 +5586,18 @@ var __C2S_DEBUG__ = false;
     }
   } catch (__namespaceBackfillErr) {}
 
-  // Safari (current WebKit) CRASHES THE WHOLE BROWSER when a declarativeNetRequest
-  // ruleset contains a "modifyHeaders" action: reading the rule back from its SQLite
-  // store null-derefs in WebExtensionContext::loadDeclarativeNetRequestRules ->
-  // getRulesWithRuleIDs (EXC_BAD_ACCESS at 0x24). The Claude service worker registers
-  // a modifyHeaders SESSION rule to pin Origin for api.anthropic.com — which Safari
-  // ignores anyway (Origin is browser-controlled) and which the fetch/XHR header patch
-  // below already covers. Strip modifyHeaders rules out of update{Session,Dynamic}Rules
-  // so the crash never arms; block/redirect/allow rules pass through untouched.
+  // Safari ACCEPTS a declarativeNetRequest modifyHeaders rule and then never acts on
+  // it. Measured on Safari 26.6.2 with a converted extension holding all-website
+  // access: update{Session,Dynamic}Rules resolves, get{Session,Dynamic}Rules lists the
+  // rule back verbatim, and every request still carries Safari's own User-Agent and
+  // Referer — main-frame navigation, page XHR and subresources alike. A `block` rule
+  // registered in the SAME call did block, so the rule list is compiled and live; the
+  // header action specifically is inert (and responseHeaders are not implemented at
+  // all, WebKit bug 263818). On top of that, a header name off WebKit's allowlist
+  // (x-forwarded-for, any custom x-*) makes the call throw SYNCHRONOUSLY, which aborts
+  // the extension's own registration code and costs it every other rule in the batch.
+  // So drop these rules: they cannot work, and they can take working rules down with
+  // them. block/redirect/allow rules pass through untouched.
   if (hasChrome && chrome.declarativeNetRequest) {
     var dnrNs = mutableNamespace(chrome, "declarativeNetRequest") || chrome.declarativeNetRequest;
     // Chrome exposes string-enum objects + onRuleMatchedDebug on the DNR namespace
@@ -5610,25 +5619,31 @@ var __C2S_DEBUG__ = false;
       var safe = opts.addRules.filter(function (r) {
         return !(r && r.action && r.action.type === "modifyHeaders");
       });
-      return safe.length === opts.addRules.length ? opts : Object.assign({}, opts, { addRules: safe });
+      if (safe.length === opts.addRules.length) return opts;
+      dbg("[c2s] DNR strip: " + (opts.addRules.length - safe.length) + " modifyHeaders rule(s) of " + opts.addRules.length + " (Safari never applies them)");
+      return Object.assign({}, opts, { addRules: safe });
     };
     var wrapDnrUpdate = function (name) {
       var orig = dnrNs[name];
-      if (typeof orig !== "function" || orig.__c2sWrapped) return;
-      // One call, resolving true when Safari accepted it. Passes both a callback and
-      // reads the returned promise so it works whichever style the platform hands us.
+      if (typeof orig !== "function") { dbg("[c2s] DNR " + name + ": absent, nothing to wrap"); return; }
+      if (orig.__c2sWrapped) return;
+      // One call, resolving { ok, err } — accepted, or the reason Safari gave. Passes
+      // both a callback and reads the returned promise so it works whichever style the
+      // platform hands us.
       var tryOne = function (arg) {
         return new Promise(function (res) {
           var done = false;
-          var fin = function (ok) { if (!done) { done = true; res(ok); } };
+          var fin = function (ok, err) { if (!done) { done = true; res({ ok: ok, err: err }); } };
           try {
             var p = orig.call(dnrNs, arg, function () {
               var e = null;
               try { e = chrome.runtime && chrome.runtime.lastError; } catch (e2) {}
-              fin(!e);
+              fin(!e, e && e.message);
             });
-            if (p && typeof p.then === "function") p.then(function () { fin(true); }, function () { fin(false); });
-          } catch (e) { fin(false); }
+            if (p && typeof p.then === "function") {
+              p.then(function () { fin(true); }, function (e) { fin(false, (e && e.message) || String(e)); });
+            }
+          } catch (e) { fin(false, (e && e.message) || String(e)); }
         });
       };
       // Safari rejects the WHOLE update when any single rule is invalid, most often an
@@ -5637,9 +5652,11 @@ var __C2S_DEBUG__ = false;
       // other rule in the batch: Tampermonkey registers all its *.user.js interception
       // rules in one call, so a single unsupported pattern killed userscript-URL
       // detection outright. Re-apply the removals, then add rules one at a time and
-      // keep whatever Safari accepts.
+      // keep whatever Safari accepts. Under --debug, tally WHY the rest were refused:
+      // "N of 800 rules landed" is useless without the reason Safari gave.
       var salvage = function (opts) {
         var kept = 0;
+        var reasons = DBG ? {} : null;
         var chain = Promise.resolve();
         if (opts && opts.removeRuleIds && opts.removeRuleIds.length) {
           chain = chain.then(function () { return tryOne({ removeRuleIds: opts.removeRuleIds }); });
@@ -5647,36 +5664,64 @@ var __C2S_DEBUG__ = false;
         var add = (opts && opts.addRules) || [];
         add.forEach(function (r) {
           chain = chain.then(function () {
-            return tryOne({ addRules: [r] }).then(function (ok) { if (ok) kept++; });
+            return tryOne({ addRules: [r] }).then(function (res) {
+              if (res.ok) { kept++; return; }
+              if (!reasons) return;
+              // Collapse the per-rule preamble ("… rule at index 0: Rule with id 7 is
+              // invalid.") so identical causes group into one line.
+              var why = String(res.err || "unknown").replace(/Rule with id \d+ is invalid\.?\s*/g, "").replace(/.*an error with rule at index \d+:\s*/, "");
+              reasons[why] = (reasons[why] || 0) + 1;
+            });
           });
         });
-        return chain.then(function () { return kept; });
+        return chain.then(function () {
+          if (reasons) { for (var why in reasons) dbg("[c2s] DNR refused x" + reasons[why] + ": " + why); }
+          return kept;
+        });
       };
       var wrapped = function (opts, cb) {
         try { opts = stripModifyHeaders(opts); } catch (e) {}
         var addCount = (opts && opts.addRules && opts.addRules.length) || 0;
-        if (typeof cb === "function") {
-          return orig.call(dnrNs, opts, function () {
-            var err = null;
-            try { err = chrome.runtime && chrome.runtime.lastError; } catch (e) {}
-            if (!err) { try { cb(); } catch (e) {} return; }
-            salvage(opts).then(function (kept) {
-              // Nothing landed at all: the original failure is the honest answer.
-              if (!kept && addCount) setLastErr({ message: String((err && err.message) || err) });
-              try { cb(); } finally { setLastErr(null); }
-            });
+        var removeCount = (opts && opts.removeRuleIds && opts.removeRuleIds.length) || 0;
+        dbg("[c2s] DNR " + name + ": +" + addCount + " -" + removeCount);
+        var recover = function (why) {
+          dbg("[c2s] DNR " + name + " rejected: " + String((why && why.message) || why));
+          salvage(opts).then(function (kept) {
+            dbg("[c2s] DNR " + name + " salvaged " + kept + "/" + addCount);
+            // Nothing landed at all: the original failure is the honest answer.
+            if (!kept && addCount) setLastErr({ message: String((why && why.message) || why) });
+            if (typeof cb === "function") { try { cb(); } finally { setLastErr(null); } } else setLastErr(null);
           });
+        };
+        if (typeof cb === "function") {
+          // Safari reports a rule it considers malformed by THROWING out of the call
+          // rather than reporting through the callback, which would otherwise abort
+          // the extension's own registration code mid-way. Catch it and salvage.
+          try {
+            return orig.call(dnrNs, opts, function () {
+              var err = null;
+              try { err = chrome.runtime && chrome.runtime.lastError; } catch (e) {}
+              if (!err) { try { cb(); } catch (e) {} return; }
+              recover(err);
+            });
+          } catch (e) { recover(e); return; }
         }
         var p;
         try { p = orig.call(dnrNs, opts); } catch (e) { p = Promise.reject(e); }
         if (!p || typeof p.then !== "function") return p;
-        return p.catch(function (e) {
-          return salvage(opts).then(function (kept) { if (!kept && addCount) throw e; });
+        return p.then(function (r) { dbg("[c2s] DNR " + name + " accepted " + addCount + " rule(s)"); return r; }, function (e) {
+          dbg("[c2s] DNR " + name + " rejected: " + String((e && e.message) || e));
+          return salvage(opts).then(function (kept) {
+            dbg("[c2s] DNR " + name + " salvaged " + kept + "/" + addCount);
+            if (!kept && addCount) throw e;
+          });
         });
       };
       // Bare assignment can silently no-op (or throw) on Safari's exotic DNR slot;
       // only mark it wrapped once the install is verified to have taken.
-      if (installOverride(dnrNs, name, wrapped)) wrapped.__c2sWrapped = true;
+      var took = installOverride(dnrNs, name, wrapped);
+      if (took) wrapped.__c2sWrapped = true;
+      dbg("[c2s] DNR " + name + " wrap installed=" + took + " nsExtensible=" + Object.isExtensible(dnrNs));
     };
     wrapDnrUpdate("updateSessionRules");
     wrapDnrUpdate("updateDynamicRules");
@@ -6540,22 +6585,19 @@ var __C2S_DEBUG__ = false;
   // some hand-written fetches (e.g. /api/oauth/account/settings) omit it, giving
   // 401 "CORS requests must set 'anthropic-dangerous-direct-browser-access'
   // header". This header IS settable from JS, so inject it here (covers fetch+XHR).
-  // The Origin header is NOT settable in-browser (JS can't, and a DNR modifyHeaders
-  // rule crashes Safari) — when a backend rejects the Safari origin anyway, the
+  // The Origin header is NOT settable in-browser (JS can't, and it is off Safari's
+  // DNR header allowlist) — when a backend rejects the Safari origin anyway, the
   // native-messaging proxy below retries the request out-of-process.
   (function () {
     var ANTH = /(^|[/.])api\.anthropic\.com(?=[/:?]|$)/i;
     var HDR = "anthropic-dangerous-direct-browser-access";
     var g = (typeof self !== "undefined") ? self : (typeof window !== "undefined" ? window : null);
-    // Gated trace: silent unless __C2S_DEBUG__ is flipped on (see shim header).
-    var DBG = (typeof __C2S_DEBUG__ !== "undefined") && __C2S_DEBUG__;
-    function dbg() { if (DBG) { try { console.log.apply(console, arguments); } catch (e) {} try { if (typeof __C2S_DEBUG_WRITE__ === "function") __C2S_DEBUG_WRITE__(arguments); } catch (e) {} } }
 
     // ---- native-messaging proxy --------------------------------------------
     // Safari sets the request Origin to safari-web-extension://<uuid>, which an
     // extension's backend may reject (e.g. an org CORS allowlist keyed on the
-    // Chrome origin). Origin/sec-fetch-* are forbidden headers JS cannot set, and
-    // a DNR modifyHeaders rule crashes Safari — so the ONLY way to send the Chrome
+    // Chrome origin). Origin/sec-fetch-site are forbidden headers JS cannot set and
+    // Safari's DNR refuses to modify — so the ONLY way to send the Chrome
     // origin is out-of-process. When a request to a declared backend host is
     // blocked in-browser (network error / 401 / 403), retry it through the Swift
     // host (browser.runtime.sendNativeMessage), which fetches it server-side with
